@@ -1,0 +1,2216 @@
+import '../../chat/providers/composer_draft_provider.dart';
+import 'dart:async';
+import 'dart:developer' as developer;
+import 'dart:io' show Platform;
+import 'dart:math' as math;
+
+import 'package:conduit/shared/widgets/platform_ui/platform_ui.dart';
+import 'package:cupertino_ui/cupertino_ui.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import 'package:conduit/l10n/app_localizations.dart';
+
+import 'package:conduit_core/models/user.dart';
+import 'package:conduit_core/models/channel.dart';
+import 'package:conduit_core/models/channel_message.dart';
+import 'package:conduit_core/providers/app_providers.dart';
+import 'package:conduit_core/services/api_service.dart';
+
+import '../utils/channel_presentation.dart';
+import '../../../core/services/native_sheet_bridge.dart';
+import '../../../shared/services/navigation_service.dart';
+import '../../../core/utils/model_icon_utils.dart';
+
+import 'package:conduit_core/utils/user_avatar_utils.dart';
+
+import '../../../shared/theme/theme_extensions.dart';
+import '../../../shared/utils/adaptive_glass.dart';
+import '../../../shared/widgets/adaptive_route_shell.dart';
+import '../../../shared/widgets/adaptive_toolbar_components.dart';
+import '../../../shared/utils/conversation_context_menu.dart';
+import '../../../shared/widgets/chrome_gradient_fade.dart';
+import '../../../shared/widgets/conduit_components.dart';
+import '../../../shared/widgets/measure_size.dart';
+import '../../../shared/widgets/model_avatar.dart';
+import '../../../shared/widgets/sidebar_layout_contract.dart';
+import '../../../shared/widgets/themed_dialogs.dart';
+import '../../../shared/widgets/themed_sheets.dart';
+import '../../../shared/widgets/user_avatar.dart';
+import '../../chat/services/file_attachment_service.dart';
+import '../../chat/widgets/modern_chat_input.dart';
+import '../../navigation/utils/chat_list_back.dart';
+
+import 'package:conduit_core/features/channels/providers/channel_app_replies.dart';
+import 'package:conduit_core/features/channels/providers/channel_members_providers.dart';
+import 'package:conduit_core/features/channels/providers/channel_providers.dart';
+import 'package:conduit_core/utils/debug_logger.dart';
+
+import '../providers/channel_socket_handler.dart';
+import '../utils/channel_request_owner.dart';
+import '../utils/mention_utils.dart';
+import '../widgets/channel_app_content.dart';
+import '../widgets/channel_form_dialog.dart';
+import '../widgets/channel_members_sheet.dart';
+import '../widgets/channel_message_content.dart';
+import '../widgets/channel_message_reactions.dart';
+import '../widgets/thread_panel.dart';
+
+/// Full-screen view for a single channel with messaging,
+/// reactions, and channel management actions.
+class ChannelPage extends ConsumerStatefulWidget {
+  /// Creates a channel page for the given [channelId].
+  const ChannelPage({super.key, required this.channelId});
+
+  /// The identifier of the channel to display.
+  final String channelId;
+
+  @override
+  ConsumerState<ChannelPage> createState() => _ChannelPageState();
+}
+
+class _ChannelPageState extends ConsumerState<ChannelPage> {
+  static const _reactionEmojis = ['👍', '❤️', '😂', '🎉', '🤔', '👀'];
+
+  final ScrollController _scrollController = ScrollController();
+  double _composerHeight = 0;
+  bool _isSending = false;
+  bool _isLoadingMore = false;
+  String? _editingMessageId;
+  final TextEditingController _editController = TextEditingController();
+  Timer? _typingTimer;
+  ChannelMessage? _replyToMessage;
+  ChannelMessage? _threadParent;
+  late final ChannelSocketHandler _socketHandler;
+  int _channelLoadGeneration = 0;
+  ApiService? _channelOwnerApi;
+  Object? _channelOwnerAuthSessionEpoch;
+  bool _channelReloadScheduled = false;
+  int _operationGeneration = 0;
+  bool _mutePending = false;
+
+  bool _ownsChannelRequest(
+    ApiService api,
+    Object authSessionEpoch,
+    String channelId,
+  ) =>
+      mounted &&
+      widget.channelId == channelId &&
+      isChannelRequestOwnerCurrent(
+        ref: ref,
+        api: api,
+        authSessionEpoch: authSessionEpoch,
+      );
+
+  bool _ownsChannelOperation(
+    ApiService api,
+    Object authSessionEpoch,
+    String channelId,
+    int operationGeneration,
+  ) =>
+      operationGeneration == _operationGeneration &&
+      _ownsChannelRequest(api, authSessionEpoch, channelId);
+
+  /// Stores [message] through [store] now, with the signed-in user as its
+  /// sender when the server left it out. If the user is still loading, the
+  /// post is not held back: the sender is filled in through [fillSender] once
+  /// the user arrives, unless the channel changed owner in the meantime.
+  void _storeOwnMessage(
+    ChannelMessage message, {
+    required void Function(ChannelMessage message) store,
+    required void Function(String messageId, User sender) fillSender,
+    required ApiService api,
+    required Object authSessionEpoch,
+    required String channelId,
+    required int operationGeneration,
+  }) {
+    final me = ref.read(currentUserProvider).value;
+    store(me == null ? message : message.withSenderIfMissing(me));
+    if (me != null) return;
+    unawaited(
+      ref.read(currentUserProvider.future).then<void>((user) {
+        if (user == null ||
+            !_ownsChannelOperation(
+              api,
+              authSessionEpoch,
+              channelId,
+              operationGeneration,
+            )) {
+          return;
+        }
+        try {
+          fillSender(message.id, user);
+        } on StateError {
+          // The list was disposed while the user loaded; nothing to fill in.
+        }
+      }, onError: (_) {}),
+    );
+  }
+
+  void _setReplyTo(ChannelMessage message) {
+    setState(() => _replyToMessage = message);
+  }
+
+  void _clearReplyTo() {
+    setState(() => _replyToMessage = null);
+  }
+
+  void _openThread(ChannelMessage message) {
+    ref.invalidate(threadMessagesProvider(widget.channelId, message.id));
+    final isTablet = MediaQuery.of(context).size.shortestSide >= 600;
+    if (isTablet) {
+      setState(() => _threadParent = message);
+    } else {
+      ThemedSheets.showCustom<void>(
+        context: context,
+        isScrollControlled: true,
+        useSafeArea: true,
+        builder: (ctx) => SizedBox(
+          height: MediaQuery.of(ctx).size.height * 0.85,
+          child: ThreadPanel(
+            channelId: widget.channelId,
+            parentMessage: message,
+            onClose: () => Navigator.pop(ctx),
+            onReactionTap: _toggleReaction,
+            overflowButtonBuilder: (size) =>
+                _buildAttachmentButton(size, parentMessageId: message.id),
+          ),
+        ),
+      );
+    }
+  }
+
+  void _clearTransientChannelState(
+    String channelId, {
+    bool notify = false,
+    bool invalidateThread = true,
+  }) {
+    _operationGeneration += 1;
+    final threadParent = _threadParent;
+    if (invalidateThread && threadParent != null) {
+      ref.invalidate(threadMessagesProvider(channelId, threadParent.id));
+    }
+
+    void reset() {
+      _threadParent = null;
+      _replyToMessage = null;
+      _editingMessageId = null;
+      _editController.clear();
+      _isSending = false;
+      _isLoadingMore = false;
+    }
+
+    if (notify) {
+      setState(reset);
+    } else {
+      reset();
+    }
+  }
+
+  @override
+  void didUpdateWidget(covariant ChannelPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.channelId != oldWidget.channelId) {
+      final previousChannelId = oldWidget.channelId;
+      final previousThreadParentId = _threadParent?.id;
+      final nextChannelId = widget.channelId;
+      _clearTransientChannelState(previousChannelId, invalidateThread: false);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        if (previousThreadParentId != null) {
+          ref.invalidate(
+            threadMessagesProvider(previousChannelId, previousThreadParentId),
+          );
+        }
+        if (widget.channelId != nextChannelId) return;
+        ref.read(activeChannelProvider.notifier).clear();
+        unawaited(_loadChannel());
+      });
+      // Defer subscribe — unsubscribe clears ChannelTypingUsers
+      // state which is not allowed during the build phase.
+      Future(() {
+        if (!mounted) return;
+        ref
+            .read(channelSocketHandlerProvider.notifier)
+            .subscribe(widget.channelId);
+      });
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _socketHandler = ref.read(channelSocketHandlerProvider.notifier);
+    _channelOwnerApi = ref.read(apiServiceProvider);
+    _channelOwnerAuthSessionEpoch = ref.read(openWebUiAuthSessionEpochProvider);
+    _scrollController.addListener(_onScroll);
+    _loadChannel();
+    // Defer subscribe to after the build phase — unsubscribe
+    // clears ChannelTypingUsers state which is not allowed
+    // during initState.
+    Future(() {
+      if (!mounted) return;
+      _socketHandler.subscribe(widget.channelId);
+    });
+  }
+
+  void _scheduleChannelReloadForOwnerChange() {
+    if (_channelReloadScheduled) return;
+    _channelReloadScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _channelReloadScheduled = false;
+      if (!mounted) return;
+      _clearTransientChannelState(widget.channelId, notify: true);
+      ref.read(activeChannelProvider.notifier).clear();
+      unawaited(_loadChannel());
+    });
+  }
+
+  @override
+  void dispose() {
+    _channelLoadGeneration += 1;
+    _typingTimer?.cancel();
+    _editController.dispose();
+    _scrollController
+      ..removeListener(_onScroll)
+      ..dispose();
+    try {
+      _socketHandler.unsubscribe();
+    } catch (_) {
+      // Provider may already be disposed during hot reload or
+      // container teardown — the keepAlive notifier's own
+      // ref.onDispose will clean up in that case.
+    }
+    super.dispose();
+  }
+
+  /// Fetches the channel details and sets it as active.
+  Future<void> _loadChannel() async {
+    final channelId = widget.channelId;
+    final generation = ++_channelLoadGeneration;
+    ref.invalidate(channelMessagesProvider(channelId));
+    final api = ref.read(apiServiceProvider);
+    if (api == null) return;
+    final authSessionEpoch = ref.read(openWebUiAuthSessionEpochProvider);
+    try {
+      final json = await api.getChannel(channelId);
+      if (generation != _channelLoadGeneration ||
+          !_ownsChannelRequest(api, authSessionEpoch, channelId)) {
+        return;
+      }
+      final channel = Channel.fromJson(json);
+      ref.read(activeChannelProvider.notifier).set(channel);
+      ref.read(channelSocketHandlerProvider.notifier).emitLastReadAt(channelId);
+      // Reset-on-visit: clear the local unread badge to match the server-side
+      // read we just emitted.
+      ref.read(channelsListProvider.notifier).markRead(channelId);
+    } catch (e, s) {
+      developer.log(
+        'Failed to load channel details',
+        name: 'ChannelPage',
+        error: e,
+        stackTrace: s,
+      );
+    }
+  }
+
+  /// Triggers pagination when the user scrolls near the top
+  /// of the reversed list (which corresponds to older messages).
+  void _onScroll() {
+    if (_isLoadingMore) return;
+    final position = _scrollController.position;
+    if (position.pixels >= position.maxScrollExtent - 200) {
+      _loadMoreMessages();
+    }
+  }
+
+  Future<void> _loadMoreMessages() async {
+    final operationGeneration = _operationGeneration;
+    final notifier = ref.read(
+      channelMessagesProvider(widget.channelId).notifier,
+    );
+    if (!notifier.hasMore()) return;
+    if (!mounted || operationGeneration != _operationGeneration) return;
+    setState(() => _isLoadingMore = true);
+    try {
+      await notifier.loadMore();
+    } finally {
+      if (mounted && operationGeneration == _operationGeneration) {
+        setState(() => _isLoadingMore = false);
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Sending messages
+  // ---------------------------------------------------------------------------
+
+  Future<void> _sendMessage(String text) async {
+    final content = text.trim();
+    if (content.isEmpty || _isSending) return;
+
+    final api = ref.read(apiServiceProvider);
+    if (api == null) return;
+    final authSessionEpoch = ref.read(openWebUiAuthSessionEpochProvider);
+    final channelId = widget.channelId;
+    final replyToId = _replyToMessage?.id;
+    final operationGeneration = _operationGeneration;
+
+    if (!mounted || operationGeneration != _operationGeneration) return;
+    setState(() => _isSending = true);
+    try {
+      final tempId = DateTime.now().microsecondsSinceEpoch.toString();
+      final json = await api.postChannelMessage(
+        channelId,
+        content: content,
+        tempId: tempId,
+        replyToId: replyToId,
+      );
+      if (!mounted ||
+          !_ownsChannelOperation(
+            api,
+            authSessionEpoch,
+            channelId,
+            operationGeneration,
+          )) {
+        return;
+      }
+      final channelMessages = ref.read(
+        channelMessagesProvider(channelId).notifier,
+      );
+      _storeOwnMessage(
+        ChannelMessage.fromJson(json),
+        store: channelMessages.prependMessage,
+        fillSender: channelMessages.fillSender,
+        api: api,
+        authSessionEpoch: authSessionEpoch,
+        channelId: channelId,
+        operationGeneration: operationGeneration,
+      );
+      _clearReplyTo();
+    } catch (e, s) {
+      developer.log(
+        'Failed to send channel message',
+        name: 'ChannelPage',
+        error: e,
+        stackTrace: s,
+      );
+      if (!mounted ||
+          !_ownsChannelOperation(
+            api,
+            authSessionEpoch,
+            channelId,
+            operationGeneration,
+          )) {
+        return;
+      }
+      final l10n = AppLocalizations.of(context);
+      if (l10n != null) {
+        AdaptiveSnackBar.show(context, message: l10n.channelSendError);
+      }
+    } finally {
+      if (mounted && operationGeneration == _operationGeneration) {
+        setState(() => _isSending = false);
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Attachment popup (plus button)
+  // ---------------------------------------------------------------------------
+
+  /// Builds the overflow (+) button as an [AdaptivePopupMenuButton]
+  /// with file, photo, and camera actions.
+  Widget _buildAttachmentButton(double size, {String? parentMessageId}) {
+    final l10n = AppLocalizations.of(context);
+
+    return AdaptivePopupMenuButton.widget<String>(
+      items: [
+        AdaptivePopupMenuItem<String>(
+          value: 'file',
+          label: l10n?.file ?? 'File',
+          icon: Platform.isIOS ? CupertinoIcons.doc : Icons.attach_file,
+        ),
+        AdaptivePopupMenuItem<String>(
+          value: 'photo',
+          label: l10n?.photo ?? 'Photo',
+          icon: Platform.isIOS ? CupertinoIcons.photo : Icons.image,
+        ),
+        AdaptivePopupMenuItem<String>(
+          value: 'camera',
+          label: l10n?.camera ?? 'Camera',
+          icon: Platform.isIOS ? CupertinoIcons.camera : Icons.camera_alt,
+        ),
+      ],
+      onSelected: (index, entry) => _handleAttachmentAction(
+        entry.value as String,
+        parentMessageId: parentMessageId,
+      ),
+      child: SizedBox.square(
+        dimension: size,
+        child: Icon(
+          Platform.isIOS ? CupertinoIcons.add : Icons.add,
+          size: IconSize.large,
+          color: context.conduitTheme.textPrimary.withValues(
+            alpha: Alpha.strong,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _handleAttachmentAction(
+    String action, {
+    String? parentMessageId,
+  }) async {
+    final api = ref.read(apiServiceProvider);
+    if (api == null) return;
+    final authSessionEpoch = ref.read(openWebUiAuthSessionEpochProvider);
+    final channelId = widget.channelId;
+    final operationGeneration = _operationGeneration;
+    final fileService = ref.read(fileAttachmentServiceProvider);
+    if (fileService == null) {
+      return;
+    }
+
+    switch (action) {
+      case 'file':
+        final attachments = List<LocalAttachment>.from(
+          await fileService.pickFiles(),
+        );
+        if (!_ownsChannelOperation(
+          api,
+          authSessionEpoch,
+          channelId,
+          operationGeneration,
+        )) {
+          return;
+        }
+        await _sendAttachmentMessage(
+          attachments,
+          api: api,
+          authSessionEpoch: authSessionEpoch,
+          channelId: channelId,
+          operationGeneration: operationGeneration,
+          parentMessageId: parentMessageId,
+        );
+      case 'photo':
+        final attachments = List<LocalAttachment>.from(
+          await fileService.pickImages(),
+        );
+        if (!_ownsChannelOperation(
+          api,
+          authSessionEpoch,
+          channelId,
+          operationGeneration,
+        )) {
+          return;
+        }
+        await _sendAttachmentMessage(
+          attachments,
+          api: api,
+          authSessionEpoch: authSessionEpoch,
+          channelId: channelId,
+          operationGeneration: operationGeneration,
+          parentMessageId: parentMessageId,
+        );
+      case 'camera':
+        final attachment = await fileService.takePhoto() as LocalAttachment?;
+        if (attachment != null &&
+            _ownsChannelOperation(
+              api,
+              authSessionEpoch,
+              channelId,
+              operationGeneration,
+            )) {
+          await _sendAttachmentMessage(
+            [attachment],
+            api: api,
+            authSessionEpoch: authSessionEpoch,
+            channelId: channelId,
+            operationGeneration: operationGeneration,
+            parentMessageId: parentMessageId,
+          );
+        }
+    }
+  }
+
+  Future<void> _sendAttachmentMessage(
+    List<LocalAttachment> attachments, {
+    required ApiService api,
+    required Object authSessionEpoch,
+    required String channelId,
+    required int operationGeneration,
+    String? parentMessageId,
+  }) async {
+    if (attachments.isEmpty || _isSending) return;
+    final replyToId = parentMessageId == null ? _replyToMessage?.id : null;
+
+    if (!_ownsChannelOperation(
+      api,
+      authSessionEpoch,
+      channelId,
+      operationGeneration,
+    )) {
+      return;
+    }
+    setState(() => _isSending = true);
+    try {
+      final attachmentSizes = <LocalAttachment, int>{};
+      for (final attachment in attachments) {
+        final fileSize = await attachment.file.length();
+        if (!_ownsChannelOperation(
+          api,
+          authSessionEpoch,
+          channelId,
+          operationGeneration,
+        )) {
+          return;
+        }
+        attachmentSizes[attachment] = fileSize;
+        if (!_validateChannelAttachmentSize(fileSize, 20)) {
+          if (!mounted ||
+              !_ownsChannelOperation(
+                api,
+                authSessionEpoch,
+                channelId,
+                operationGeneration,
+              )) {
+            return;
+          }
+          AdaptiveSnackBar.show(
+            context,
+            message: AppLocalizations.of(context)!.channelSendError,
+          );
+          return;
+        }
+      }
+
+      final files = <Map<String, dynamic>>[];
+      for (final attachment in attachments) {
+        if (!_ownsChannelOperation(
+          api,
+          authSessionEpoch,
+          channelId,
+          operationGeneration,
+        )) {
+          return;
+        }
+        final fileSize = attachmentSizes[attachment]!;
+        final contentType = _contentTypeForChannelAttachment(attachment);
+        final fileId = await api.uploadFile(
+          attachment.file.path,
+          attachment.displayName,
+          contentType: contentType,
+          metadata: {'channel_id': channelId},
+        );
+        if (!_ownsChannelOperation(
+          api,
+          authSessionEpoch,
+          channelId,
+          operationGeneration,
+        )) {
+          return;
+        }
+        files.add({
+          'type': attachment.isImage ? 'image' : 'file',
+          'id': fileId,
+          'url': fileId,
+          'name': attachment.displayName,
+          'size': fileSize,
+          'status': 'uploaded',
+          'content_type': ?contentType,
+        });
+      }
+
+      if (files.isEmpty) return;
+
+      final tempId = DateTime.now().microsecondsSinceEpoch.toString();
+      final json = await api.postChannelMessage(
+        channelId,
+        content: '',
+        tempId: tempId,
+        replyToId: replyToId,
+        parentId: parentMessageId,
+        data: {'files': files},
+      );
+      if (!mounted ||
+          !_ownsChannelOperation(
+            api,
+            authSessionEpoch,
+            channelId,
+            operationGeneration,
+          )) {
+        return;
+      }
+
+      final message = ChannelMessage.fromJson(json);
+      if (parentMessageId != null) {
+        final replies = ref.read(
+          threadMessagesProvider(channelId, parentMessageId).notifier,
+        );
+        _storeOwnMessage(
+          message,
+          store: replies.prependMessage,
+          fillSender: replies.fillSender,
+          api: api,
+          authSessionEpoch: authSessionEpoch,
+          channelId: channelId,
+          operationGeneration: operationGeneration,
+        );
+      } else {
+        final channelMessages = ref.read(
+          channelMessagesProvider(channelId).notifier,
+        );
+        _storeOwnMessage(
+          message,
+          store: channelMessages.prependMessage,
+          fillSender: channelMessages.fillSender,
+          api: api,
+          authSessionEpoch: authSessionEpoch,
+          channelId: channelId,
+          operationGeneration: operationGeneration,
+        );
+        _clearReplyTo();
+      }
+    } catch (e, s) {
+      developer.log(
+        'Failed to send channel attachment',
+        name: 'ChannelPage',
+        error: e,
+        stackTrace: s,
+      );
+      if (!mounted ||
+          !_ownsChannelOperation(
+            api,
+            authSessionEpoch,
+            channelId,
+            operationGeneration,
+          )) {
+        return;
+      }
+      AdaptiveSnackBar.show(
+        context,
+        message: AppLocalizations.of(context)!.channelSendError,
+      );
+    } finally {
+      if (mounted && operationGeneration == _operationGeneration) {
+        setState(() => _isSending = false);
+      }
+    }
+  }
+
+  bool _validateChannelAttachmentSize(int fileSize, int maxSizeMB) {
+    final maxSizeBytes = maxSizeMB * 1024 * 1024;
+    return fileSize <= maxSizeBytes;
+  }
+
+  String? _contentTypeForChannelAttachment(LocalAttachment attachment) {
+    return switch (attachment.extension) {
+      '.jpg' || '.jpeg' => 'image/jpeg',
+      '.png' => 'image/png',
+      '.gif' => 'image/gif',
+      '.webp' => 'image/webp',
+      '.heic' => 'image/heic',
+      '.heif' => 'image/heif',
+      '.bmp' => 'image/bmp',
+      '.pdf' => 'application/pdf',
+      '.txt' => 'text/plain',
+      '.md' => 'text/markdown',
+      '.csv' => 'text/csv',
+      '.json' => 'application/json',
+      '.mp4' => 'video/mp4',
+      '.mov' => 'video/quicktime',
+      '.mp3' => 'audio/mpeg',
+      '.wav' => 'audio/wav',
+      _ => null,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Reactions
+  // ---------------------------------------------------------------------------
+
+  Future<void> _toggleReaction(ChannelMessage message, String emoji) async {
+    final api = ref.read(apiServiceProvider);
+    if (api == null) return;
+    final channelId = widget.channelId;
+    final currentUserId = ref.read(currentUserProvider).value?.id;
+    if (currentUserId == null) return;
+
+    final existing = message.reactions.any(
+      (r) =>
+          r.name == emoji &&
+          r.users.any(
+            (u) => u['user_id'] == currentUserId || u['id'] == currentUserId,
+          ),
+    );
+
+    try {
+      // The API returns bool; the socket handler will
+      // re-fetch the message with updated reactions.
+      if (existing) {
+        await api.removeMessageReaction(channelId, message.id, emoji);
+      } else {
+        await api.addMessageReaction(channelId, message.id, emoji);
+      }
+    } catch (e, s) {
+      developer.log(
+        'Failed to toggle reaction',
+        name: 'ChannelPage',
+        error: e,
+        stackTrace: s,
+      );
+    }
+  }
+
+  Future<void> _deleteMessage(ChannelMessage message) async {
+    final api = ref.read(apiServiceProvider);
+    if (api == null) return;
+    final authSessionEpoch = ref.read(openWebUiAuthSessionEpochProvider);
+    final channelId = widget.channelId;
+    final operationGeneration = _operationGeneration;
+    try {
+      await api.deleteChannelMessage(channelId, message.id);
+      if (!_ownsChannelOperation(
+        api,
+        authSessionEpoch,
+        channelId,
+        operationGeneration,
+      )) {
+        return;
+      }
+      ref
+          .read(channelMessagesProvider(channelId).notifier)
+          .removeMessage(message.id);
+    } catch (e, s) {
+      developer.log(
+        'Failed to delete message',
+        name: 'ChannelPage',
+        error: e,
+        stackTrace: s,
+      );
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Message editing
+  // ---------------------------------------------------------------------------
+
+  void _startEditingMessage(ChannelMessage message) {
+    setState(() {
+      _editingMessageId = message.id;
+      _editController.text = message.content;
+    });
+  }
+
+  void _cancelEditing() {
+    setState(() {
+      _editingMessageId = null;
+      _editController.clear();
+    });
+  }
+
+  Future<void> _submitEdit(ChannelMessage message) async {
+    final newContent = _editController.text.trim();
+    if (newContent.isEmpty || newContent == message.content) {
+      _cancelEditing();
+      return;
+    }
+
+    final api = ref.read(apiServiceProvider);
+    if (api == null) return;
+    final authSessionEpoch = ref.read(openWebUiAuthSessionEpochProvider);
+    final channelId = widget.channelId;
+    final operationGeneration = _operationGeneration;
+
+    try {
+      final json = await api.updateChannelMessage(
+        channelId,
+        message.id,
+        content: newContent,
+      );
+      if (!_ownsChannelOperation(
+        api,
+        authSessionEpoch,
+        channelId,
+        operationGeneration,
+      )) {
+        return;
+      }
+      ref
+          .read(channelMessagesProvider(channelId).notifier)
+          .applyEditResponse(ChannelMessage.fromJson(json));
+    } catch (e, st) {
+      developer.log(
+        'Failed to edit message',
+        name: 'ChannelPage',
+        error: e,
+        stackTrace: st,
+      );
+    }
+    if (_ownsChannelOperation(
+      api,
+      authSessionEpoch,
+      channelId,
+      operationGeneration,
+    )) {
+      _cancelEditing();
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Pin / unpin
+  // ---------------------------------------------------------------------------
+
+  Future<void> _togglePin(ChannelMessage message) async {
+    final api = ref.read(apiServiceProvider);
+    if (api == null) return;
+    final authSessionEpoch = ref.read(openWebUiAuthSessionEpochProvider);
+    final channelId = widget.channelId;
+    final operationGeneration = _operationGeneration;
+
+    try {
+      final json = await api.pinMessage(
+        channelId,
+        message.id,
+        isPinned: !message.isPinned,
+      );
+      if (json == null ||
+          !_ownsChannelOperation(
+            api,
+            authSessionEpoch,
+            channelId,
+            operationGeneration,
+          )) {
+        return;
+      }
+      ref
+          .read(channelMessagesProvider(channelId).notifier)
+          .applyPinResponse(ChannelMessage.fromJson(json));
+    } catch (e, st) {
+      developer.log(
+        'Failed to toggle pin',
+        name: 'ChannelPage',
+        error: e,
+        stackTrace: st,
+      );
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Message actions
+  // ---------------------------------------------------------------------------
+
+  List<ConduitContextMenuAction> _buildMessageActions(ChannelMessage message) {
+    final l10n = AppLocalizations.of(context)!;
+    final currentUserId = ref.read(currentUserProvider).value?.id;
+    // An app message has no user id, so it must not match a user that is
+    // still loading.
+    final isOwn = currentUserId != null && message.userId == currentUserId;
+
+    return [
+      ConduitContextMenuAction(
+        cupertinoIcon: CupertinoIcons.smiley,
+        sfSymbol: 'face.smiling',
+        materialIcon: Icons.emoji_emotions_outlined,
+        label: l10n.channelMessageReact,
+        onSelected: () async => _showEmojiPicker(message),
+      ),
+      ConduitContextMenuAction(
+        cupertinoIcon: CupertinoIcons.reply,
+        sfSymbol: 'arrowshape.turn.up.left',
+        materialIcon: Icons.reply_outlined,
+        label: l10n.channelMessageReply,
+        onSelected: () async => _setReplyTo(message),
+      ),
+      if (message.parentId == null)
+        ConduitContextMenuAction(
+          cupertinoIcon: CupertinoIcons.bubble_left_bubble_right,
+          sfSymbol: 'bubble.left.and.bubble.right',
+          materialIcon: Icons.forum_outlined,
+          label: message.replyCount > 0
+              ? l10n.threadWithCount(message.replyCount)
+              : l10n.thread,
+          onSelected: () async => _openThread(message),
+        ),
+      ConduitContextMenuAction(
+        cupertinoIcon: message.isPinned
+            ? CupertinoIcons.pin_slash
+            : CupertinoIcons.pin,
+        sfSymbol: message.isPinned ? 'pin.slash' : 'pin',
+        materialIcon: Icons.push_pin_outlined,
+        label: message.isPinned ? l10n.unpin : l10n.pin,
+        onSelected: () async => _togglePin(message),
+      ),
+      if (isOwn)
+        ConduitContextMenuAction(
+          cupertinoIcon: CupertinoIcons.pencil,
+          sfSymbol: 'pencil',
+          materialIcon: Icons.edit_outlined,
+          label: l10n.channelMessageEdit,
+          onSelected: () async => _startEditingMessage(message),
+        ),
+      ConduitContextMenuAction(
+        cupertinoIcon: CupertinoIcons.delete,
+        sfSymbol: 'trash',
+        materialIcon: Icons.delete_outline,
+        label: l10n.channelMessageDelete,
+        destructive: true,
+        onSelected: () async => _deleteMessage(message),
+      ),
+    ];
+  }
+
+  void _showEmojiPicker(ChannelMessage message) async {
+    final api = ref.read(apiServiceProvider);
+    if (api == null) return;
+    final authSessionEpoch = ref.read(openWebUiAuthSessionEpochProvider);
+    final channelId = widget.channelId;
+    final operationGeneration = _operationGeneration;
+
+    bool ownsPicker() =>
+        operationGeneration == _operationGeneration &&
+        _ownsChannelRequest(api, authSessionEpoch, channelId);
+
+    if (Platform.isIOS) {
+      try {
+        final emoji = await NativeSheetBridge.instance.presentOptionsSelector(
+          title: AppLocalizations.of(context)!.channelMessageReact,
+          options: [
+            for (final emoji in _reactionEmojis)
+              NativeSheetOptionConfig(
+                id: emoji,
+                label: emoji,
+                sfSymbol: 'face.smiling',
+              ),
+          ],
+          rethrowErrors: true,
+        );
+        if (emoji != null && ownsPicker()) {
+          unawaited(_toggleReaction(message, emoji));
+        }
+        return;
+      } catch (_) {
+        if (!mounted) {
+          return;
+        }
+      }
+    }
+
+    if (!mounted || !ownsPicker()) {
+      return;
+    }
+
+    ThemedSheets.showSurface<void>(
+      context: context,
+      showHandle: false,
+      padding: const EdgeInsets.symmetric(
+        vertical: Spacing.md,
+        horizontal: Spacing.lg,
+      ),
+      builder: (ctx) => Wrap(
+        spacing: Spacing.md,
+        runSpacing: Spacing.md,
+        alignment: WrapAlignment.center,
+        children: _reactionEmojis.map((emoji) {
+          return GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () {
+              Navigator.pop(ctx);
+              if (ownsPicker()) {
+                unawaited(_toggleReaction(message, emoji));
+              }
+            },
+            child: Padding(
+              padding: const EdgeInsets.all(Spacing.sm),
+              child: Text(emoji, style: const TextStyle(fontSize: 28)),
+            ),
+          );
+        }).toList(),
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Channel menu actions
+  // ---------------------------------------------------------------------------
+
+  Future<void> _editChannel(Channel channel) async {
+    final channelId = widget.channelId;
+    final api = ref.read(apiServiceProvider);
+    if (api == null) return;
+    final authSessionEpoch = ref.read(openWebUiAuthSessionEpochProvider);
+    final operationGeneration = _operationGeneration;
+    final result = await showEditChannelFormDialog(
+      context,
+      channel: channel,
+      includePrivacyToggle: false,
+    );
+    if (result == null ||
+        !_ownsChannelOperation(
+          api,
+          authSessionEpoch,
+          channelId,
+          operationGeneration,
+        )) {
+      return;
+    }
+    if (result.name == channel.name &&
+        result.description == channel.description) {
+      return;
+    }
+
+    try {
+      final json = await api.updateChannel(
+        channel.id,
+        name: result.name,
+        description: result.description,
+      );
+      if (!_ownsChannelOperation(
+        api,
+        authSessionEpoch,
+        channelId,
+        operationGeneration,
+      )) {
+        return;
+      }
+      final updated = Channel.fromJson(json);
+      ref.read(activeChannelProvider.notifier).set(updated);
+      ref.read(channelsListProvider.notifier).updateChannel(updated);
+    } catch (e, s) {
+      developer.log(
+        'Failed to update channel',
+        name: 'ChannelPage',
+        error: e,
+        stackTrace: s,
+      );
+    }
+  }
+
+  /// Sets the channel to notify for every message or for mentions only, as
+  /// Open WebUI's ChannelMenu does.
+  Future<void> _setChannelMuted(bool muted, {required bool current}) async {
+    if (_mutePending || muted == current) return;
+    final channelId = widget.channelId;
+    final api = ref.read(apiServiceProvider);
+    if (api == null) return;
+    final authSessionEpoch = ref.read(openWebUiAuthSessionEpochProvider);
+    final operationGeneration = _operationGeneration;
+    final l10n = AppLocalizations.of(context);
+    _mutePending = true;
+    try {
+      await ref
+          .read(channelsListProvider.notifier)
+          .updateMuted(channelId, muted);
+    } catch (e, s) {
+      DebugLogger.error(
+        'mute-channel-failed',
+        scope: 'channels/page',
+        error: e,
+        stackTrace: s,
+      );
+      if (!mounted ||
+          l10n == null ||
+          !_ownsChannelOperation(
+            api,
+            authSessionEpoch,
+            channelId,
+            operationGeneration,
+          )) {
+        return;
+      }
+      AdaptiveSnackBar.show(context, message: l10n.errorMessage);
+    } finally {
+      _mutePending = false;
+    }
+  }
+
+  /// Whether the channel notifies for mentions only. The channel list holds
+  /// the latest setting; a channel it does not list falls back to its details.
+  bool _watchChannelMuted(Channel? channel) {
+    final channelId = widget.channelId;
+    final listed = ref.watch(
+      channelsListProvider.select((channels) {
+        for (final item in channels.value ?? const <Channel>[]) {
+          if (item.id == channelId) return item.isChannelMuted;
+        }
+        return null;
+      }),
+    );
+    return listed ?? channel?.isChannelMuted ?? false;
+  }
+
+  Future<void> _leaveChannel() async {
+    final channelId = widget.channelId;
+    final api = ref.read(apiServiceProvider);
+    if (api == null) return;
+    final authSessionEpoch = ref.read(openWebUiAuthSessionEpochProvider);
+    final operationGeneration = _operationGeneration;
+    final l10n = AppLocalizations.of(context);
+    final confirmed = await ThemedDialogs.confirm(
+      context,
+      title: l10n?.channelLeave ?? 'Leave Channel',
+      message: l10n?.channelLeaveConfirm ?? 'Leave this channel?',
+    );
+    if (!confirmed ||
+        !_ownsChannelOperation(
+          api,
+          authSessionEpoch,
+          channelId,
+          operationGeneration,
+        )) {
+      return;
+    }
+
+    try {
+      await api.updateMemberActiveStatus(channelId, isActive: false);
+      if (!_ownsChannelOperation(
+        api,
+        authSessionEpoch,
+        channelId,
+        operationGeneration,
+      )) {
+        return;
+      }
+      ref.read(channelsListProvider.notifier).removeChannel(channelId);
+      ref.read(activeChannelProvider.notifier).clear();
+      NavigationService.router.go(Routes.chat);
+    } catch (e, s) {
+      developer.log(
+        'Failed to leave channel',
+        name: 'ChannelPage',
+        error: e,
+        stackTrace: s,
+      );
+    }
+  }
+
+  Future<void> _deleteChannel() async {
+    final channelId = widget.channelId;
+    final api = ref.read(apiServiceProvider);
+    if (api == null) return;
+    final authSessionEpoch = ref.read(openWebUiAuthSessionEpochProvider);
+    final operationGeneration = _operationGeneration;
+    final l10n = AppLocalizations.of(context);
+    final confirmed = await ThemedDialogs.confirm(
+      context,
+      title: l10n?.channelDelete ?? 'Delete Channel',
+      message:
+          l10n?.channelDeleteConfirm ??
+          'Delete this channel? This cannot be undone.',
+      isDestructive: true,
+    );
+    if (!confirmed ||
+        !_ownsChannelOperation(
+          api,
+          authSessionEpoch,
+          channelId,
+          operationGeneration,
+        )) {
+      return;
+    }
+
+    try {
+      await api.deleteChannel(channelId);
+      if (!_ownsChannelOperation(
+        api,
+        authSessionEpoch,
+        channelId,
+        operationGeneration,
+      )) {
+        return;
+      }
+      ref.read(channelsListProvider.notifier).removeChannel(channelId);
+      ref.read(activeChannelProvider.notifier).clear();
+      NavigationService.router.go(Routes.chat);
+    } catch (e, s) {
+      developer.log(
+        'Failed to delete channel',
+        name: 'ChannelPage',
+        error: e,
+        stackTrace: s,
+      );
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Build
+  // ---------------------------------------------------------------------------
+
+  @override
+  Widget build(BuildContext context) {
+    // Keep the socket handler's owner watches active while this channel is on
+    // screen so a replaced socket/auth session rebinds without navigation.
+    ref.watch(channelSocketHandlerProvider);
+    final api = ref.watch(apiServiceProvider);
+    final authSessionEpoch = ref.watch(openWebUiAuthSessionEpochProvider);
+    if (!identical(_channelOwnerApi, api) ||
+        !identical(_channelOwnerAuthSessionEpoch, authSessionEpoch)) {
+      _channelOwnerApi = api;
+      _channelOwnerAuthSessionEpoch = authSessionEpoch;
+      _scheduleChannelReloadForOwnerChange();
+    }
+    final theme = context.conduitTheme;
+    return ChatListBackScope(child: _buildScaffold(context, theme));
+  }
+
+  // Equal side insets keep the icon and name centered in the title pill.
+  static const double _channelTitleInset = 12;
+
+  Widget _buildChannelTitlePill(
+    BuildContext context,
+    Channel? channel, {
+    required double maxWidth,
+  }) {
+    final label = channel == null
+        ? ''
+        : channelDisplayName(
+            channel,
+            fallback: AppLocalizations.of(context)!.channelUnknownMember,
+          );
+    final textStyle = conduitAdaptiveToolbarLeadingTitleTextStyle(context);
+    final controlExtent = conduitScaledControlExtent(context);
+    final iconExtent = conduitScaledIconExtent(context, IconSize.appBar);
+    final leadingIcon = channel == null ? Icons.tag : channelIcon(channel);
+    final targetWidth = resolveConduitAdaptiveTextPillWidth(
+      context: context,
+      label: label,
+      textStyle: textStyle,
+      maxWidth: maxWidth,
+      minWidth: 96,
+      horizontalPadding: _channelTitleInset * 2,
+      leadingWidth: iconExtent + Spacing.xs,
+    );
+
+    return buildConduitAdaptiveToolbarPillSurface(
+      width: targetWidth,
+      height: controlExtent,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(minHeight: controlExtent),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: _channelTitleInset),
+          child: Center(
+            widthFactor: 1,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                ConduitSystemAdaptiveIcon(
+                  leadingIcon,
+                  size: iconExtent,
+                  color: textStyle.color!,
+                ),
+                const SizedBox(width: Spacing.xs),
+                Flexible(
+                  child: Text(
+                    label,
+                    style: textStyle,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  List<AdaptivePopupMenuEntry> _buildChannelToolbarMenuItems(
+    AppLocalizations? l10n, {
+    required bool muted,
+  }) => [
+    // Open WebUI's ChannelMenu: notify for every message or mentions only.
+    AdaptivePopupMenuItem<String>(
+      value: 'notify-all',
+      label: l10n?.channelNotifyAllMessages ?? 'All messages',
+      checked: !muted,
+      icon: conduitAdaptivePopupMenuIcon(
+        iosSymbol: 'bell',
+        materialIcon: Icons.notifications_none_rounded,
+      ),
+    ),
+    AdaptivePopupMenuItem<String>(
+      value: 'notify-mentions',
+      label: l10n?.channelNotifyMentionsOnly ?? 'Mentions only',
+      checked: muted,
+      icon: conduitAdaptivePopupMenuIcon(
+        iosSymbol: 'bell.slash',
+        materialIcon: Icons.notifications_off_outlined,
+      ),
+    ),
+    AdaptivePopupMenuItem<String>(
+      value: 'edit',
+      label: l10n?.channelEdit ?? 'Edit Channel',
+      icon: conduitAdaptivePopupMenuIcon(
+        iosSymbol: 'pencil',
+        materialIcon: Icons.edit_outlined,
+      ),
+    ),
+    AdaptivePopupMenuItem<String>(
+      value: 'leave',
+      label: l10n?.channelLeave ?? 'Leave Channel',
+      isDestructive: true,
+      icon: conduitAdaptivePopupMenuIcon(
+        iosSymbol: 'rectangle.portrait.and.arrow.right',
+        materialIcon: Icons.logout_outlined,
+      ),
+    ),
+    AdaptivePopupMenuItem<String>(
+      value: 'delete',
+      label: l10n?.channelDelete ?? 'Delete Channel',
+      isDestructive: true,
+      icon: conduitAdaptivePopupMenuIcon(
+        iosSymbol: 'trash',
+        materialIcon: Icons.delete_outline,
+      ),
+    ),
+  ];
+
+  List<Widget> _buildChannelToolbarActionWidgets(
+    ConduitThemeExtension theme,
+    Channel? channel,
+    List<AdaptivePopupMenuEntry> menuItems,
+    ValueChanged<String> onMenuSelected,
+  ) {
+    return buildConduitAdaptiveToolbarActionWidgets([
+      if (channel?.userCount case final memberCount?)
+        ConduitAdaptiveAppBarIconButton(
+          key: const ValueKey<String>('channel-page-members-button'),
+          icon: Platform.isIOS ? CupertinoIcons.person_2 : Icons.people_outline,
+          iosSymbol: 'person.2',
+          iconColor: theme.textPrimary,
+          semanticLabel:
+              AppLocalizations.of(context)?.channelMembersTitle(memberCount) ??
+              'Members ($memberCount)',
+          onPressed: _showMemberList,
+        ),
+      _ChannelToolbarPopupButton(
+        tintColor: theme.textPrimary,
+        items: menuItems,
+        onSelected: onMenuSelected,
+      ),
+    ]);
+  }
+
+  void _toggleDrawer() {
+    SidebarDrawerControllerScope.maybeOf(context)?.toggle();
+  }
+
+  AdaptiveAppBar _buildAdaptiveChannelAppBar(
+    BuildContext context,
+    ConduitThemeExtension theme,
+    Channel? channel,
+    AppLocalizations? l10n,
+  ) {
+    final memberCount = channel?.userCount;
+    final maxTitleWidth = resolveConduitAdaptiveLeadingPillWidth(
+      context,
+      trailingActionCount: memberCount != null ? 2 : 1,
+      maxWidth: kConduitAdaptiveToolbarMaxPillWidth,
+    );
+    final tintColor = theme.textPrimary;
+    final muted = _watchChannelMuted(channel);
+    final menuItems = _buildChannelToolbarMenuItems(l10n, muted: muted);
+    void onMenuSelected(String action) =>
+        _handleChannelToolbarSelection(action, channel, muted: muted);
+    final actions = _buildChannelToolbarActionWidgets(
+      theme,
+      channel,
+      menuItems,
+      onMenuSelected,
+    );
+    final nativeMenuAction = buildConduitNativeToolbarMenuAction<String>(
+      iosSymbol: 'ellipsis',
+      accessibilityLabel:
+          l10n?.more ?? MaterialLocalizations.of(context).moreButtonTooltip,
+      tintColor: tintColor,
+      items: menuItems,
+      onSelected: onMenuSelected,
+    );
+    final useNativeActionGroup =
+        Platform.isIOS &&
+        conduitSupportsNativeGlass() &&
+        nativeMenuAction != null;
+    final nativeActions = <ConduitNativeToolbarAction>[
+      if (memberCount != null)
+        ConduitNativeToolbarAction(
+          iosSymbol: 'person.2',
+          accessibilityLabel:
+              l10n?.channelMembersTitle(memberCount) ??
+              'Members ($memberCount)',
+          tintColor: tintColor,
+          onPressed: _showMemberList,
+        ),
+      ?nativeMenuAction,
+    ];
+    return buildConduitCenteredAdaptiveAppBar(
+      context: context,
+      tintColor: tintColor,
+      leading: ConduitAdaptiveAppBarIconButton(
+        icon: Platform.isIOS ? CupertinoIcons.line_horizontal_3 : Icons.menu,
+        iosSymbol: 'line.3.horizontal',
+        semanticLabel: AppLocalizations.of(context)!.sidebarButtonLabel,
+        onPressed: _toggleDrawer,
+        iconColor: tintColor,
+      ),
+      title: _buildChannelTitlePill(context, channel, maxWidth: maxTitleWidth),
+      actions: actions,
+      cupertinoTrailing: useNativeActionGroup
+          ? ConduitNativeToolbarActionGroup(actions: nativeActions)
+          : Row(mainAxisSize: MainAxisSize.min, children: actions),
+      centerTitle: false,
+    );
+  }
+
+  Widget _buildScaffold(BuildContext context, ConduitThemeExtension theme) {
+    final l10n = AppLocalizations.of(context)!;
+    final channel = ref.watch(activeChannelProvider);
+    final messagesAsync = ref.watch(channelMessagesProvider(widget.channelId));
+    // Private app replies last while the channel is on screen, as on the web,
+    // including while its messages reload.
+    ref.watch(channelAppRepliesProvider(widget.channelId, null));
+
+    return AdaptiveRouteShell(
+      backgroundColor: theme.surfaceBackground,
+      extendBodyBehindAppBar: true,
+      appBar: _buildAdaptiveChannelAppBar(context, theme, channel, l10n),
+      body: Stack(
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Stack(
+                  children: [
+                    Positioned.fill(
+                      child: messagesAsync.when(
+                        data: (messages) => NativeContextMenuViewport(
+                          padding: EdgeInsets.only(
+                            top:
+                                MediaQuery.viewPaddingOf(context).top +
+                                conduitAdaptiveToolbarHeightOf(context),
+                            bottom: math.max(0, _composerHeight - Spacing.xl),
+                          ),
+                          child: _buildMessageList(messages, theme, l10n),
+                        ),
+                        loading: () =>
+                            const Center(child: AdaptiveProgressIndicator()),
+                        error: (error, _) => Center(
+                          child: Text(
+                            error.toString(),
+                            style: AppTypography.bodyMediumStyle.copyWith(
+                              color: theme.error,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    Positioned(
+                      left: 0,
+                      right: 0,
+                      bottom: 0,
+                      child: ConduitChromeGradientFade.bottom(
+                        contentHeight: math.max(
+                          0,
+                          math.max(
+                            _composerHeight - Spacing.xl,
+                            MediaQuery.viewPaddingOf(context).bottom +
+                                Spacing.xxl,
+                          ),
+                        ),
+                        fadeHeight: Spacing.md,
+                      ),
+                    ),
+                    Positioned(
+                      left: 0,
+                      right: 0,
+                      bottom: 0,
+                      child: _buildComposerOverlay(theme, l10n),
+                    ),
+                  ],
+                ),
+              ),
+              if (_threadParent != null)
+                SizedBox(
+                  width: 320,
+                  child: Padding(
+                    padding: EdgeInsets.only(
+                      top:
+                          MediaQuery.of(context).padding.top +
+                          conduitAdaptiveToolbarHeightOf(context),
+                    ),
+                    child: ThreadPanel(
+                      channelId: widget.channelId,
+                      parentMessage: _threadParent!,
+                      onClose: () => setState(() => _threadParent = null),
+                      onReactionTap: _toggleReaction,
+                      overflowButtonBuilder: (size) => _buildAttachmentButton(
+                        size,
+                        parentMessageId: _threadParent!.id,
+                      ),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          Positioned(
+            left: 0,
+            right: 0,
+            top: 0,
+            child: ConduitChromeGradientFade.top(
+              contentHeight:
+                  MediaQuery.viewPaddingOf(context).top +
+                  conduitAdaptiveToolbarHeightOf(context),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMessageList(
+    List<ChannelMessage> messages,
+    ConduitThemeExtension theme,
+    AppLocalizations? l10n,
+  ) {
+    if (messages.isEmpty) {
+      return Center(
+        child: Text(
+          l10n?.channelNoMessages ?? 'No messages yet. Start the conversation!',
+          style: AppTypography.bodyMediumStyle.copyWith(
+            color: theme.textSecondary,
+          ),
+        ),
+      );
+    }
+
+    final currentUserId = ref.watch(currentUserProvider).value?.id;
+    final api = ref.read(apiServiceProvider);
+    final appRepliesProvider = channelAppRepliesProvider(
+      widget.channelId,
+      null,
+    );
+    final appReplies = ref.watch(appRepliesProvider);
+    List<AppChannelReplyEvent> repliesTo(ChannelMessage m) => [
+      for (final reply in appReplies.values)
+        if (reply.messageId == m.id) reply,
+    ];
+
+    // Rows are keyed by message, so what a row holds, such as a pending app
+    // button, moves with its message when a newer one arrives.
+    final indexById = {
+      for (final (index, message) in messages.indexed) message.id: index,
+    };
+    return ListView.builder(
+      controller: _scrollController,
+      reverse: true,
+      padding: EdgeInsets.only(
+        top: Spacing.md,
+        bottom: Spacing.sm + _composerHeight,
+      ),
+      itemCount: messages.length + (_isLoadingMore ? 1 : 0),
+      findChildIndexCallback: (key) =>
+          key is ValueKey<String> ? indexById[key.value] : null,
+      itemBuilder: (context, index) {
+        if (_isLoadingMore && index == messages.length) {
+          return const Padding(
+            padding: EdgeInsets.all(Spacing.md),
+            child: Center(
+              child: SizedBox(
+                width: 24,
+                height: 24,
+                child: AdaptiveProgressIndicator(strokeWidth: 2),
+              ),
+            ),
+          );
+        }
+        final message = messages[index];
+        final avatarUrl = _resolveAvatarUrl(api, message);
+
+        // Determine the effective sender ID for
+        // grouping consecutive messages. Model
+        // messages use meta.model_id as the key,
+        // and app messages, which have no user_id,
+        // use the app id in their user object.
+        String? senderOf(ChannelMessage m) {
+          if (isModelMessage(m)) {
+            return m.meta?['model_id'] as String?;
+          }
+          return m.userId ?? m.user?.id;
+        }
+
+        // In a reversed list, index+1 is the
+        // message visually above. Show profile
+        // only on the first message of a group.
+        // A private app reply under the message above also starts a group.
+        final prevIndex = index + 1;
+        final showProfile =
+            prevIndex >= messages.length ||
+            senderOf(messages[prevIndex]) != senderOf(message) ||
+            repliesTo(messages[prevIndex]).isNotEmpty;
+
+        final bubble = _MessageBubble(
+          channelId: widget.channelId,
+          onAppReply: ref.read(appRepliesProvider.notifier).add,
+          message: message,
+          avatarUrl: avatarUrl,
+          showProfile: showProfile,
+          currentUserId: currentUserId,
+          isEditing: _editingMessageId == message.id,
+          editController: _editController,
+          onSubmitEdit: () => _submitEdit(message),
+          onCancelEdit: _cancelEditing,
+          contextMenuActions: _buildMessageActions(message),
+          onReactionTap: (emoji) => _toggleReaction(message, emoji),
+          onThreadTap: message.parentId == null
+              ? () => _openThread(message)
+              : null,
+        );
+        final replies = repliesTo(message);
+        return KeyedSubtree(
+          key: ValueKey<String>(message.id),
+          child: replies.isEmpty
+              ? bubble
+              : Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    bubble,
+                    for (final reply in replies)
+                      ChannelPrivateAppReply(
+                        key: ValueKey<String>('channel-app-reply-${reply.key}'),
+                        event: reply,
+                        onDismiss: () => ref
+                            .read(appRepliesProvider.notifier)
+                            .dismiss(reply.key),
+                      ),
+                  ],
+                ),
+        );
+      },
+    );
+  }
+
+  Widget _buildComposerOverlay(
+    ConduitThemeExtension theme,
+    AppLocalizations l10n,
+  ) {
+    return RepaintBoundary(
+      child: MeasureSize(
+        onChange: (size) {
+          if (!mounted) return;
+          setState(() => _composerHeight = size.height);
+        },
+        child: SafeArea(
+          top: false,
+          left: false,
+          right: false,
+          minimum: const EdgeInsets.only(bottom: Spacing.sm),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const SizedBox(height: Spacing.xl),
+              Consumer(
+                builder: (context, ref, _) {
+                  final typingUsers = ref.watch(channelTypingUsersProvider);
+                  if (typingUsers.isEmpty) {
+                    return const SizedBox.shrink();
+                  }
+                  final names = typingUsers.values.toList();
+                  final text = names.length == 1
+                      ? '${names.first} is typing...'
+                      : '${names.join(", ")} are typing...';
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: Spacing.md,
+                      vertical: Spacing.xxs,
+                    ),
+                    child: Text(
+                      text,
+                      style: AppTypography.bodySmallStyle.copyWith(
+                        color: theme.textSecondary,
+                        fontStyle: FontStyle.italic,
+                      ),
+                    ),
+                  );
+                },
+              ),
+              if (_replyToMessage != null)
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: Spacing.md,
+                    vertical: Spacing.sm,
+                  ),
+                  color: theme.surfaceContainer,
+                  child: Row(
+                    children: [
+                      Icon(Icons.reply, size: 16, color: theme.textSecondary),
+                      const SizedBox(width: Spacing.sm),
+                      Expanded(
+                        child: Text(
+                          l10n.replyingToUser(_replyToMessage!.userName),
+                          style: AppTypography.bodySmallStyle.copyWith(
+                            color: theme.textSecondary,
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      ConduitIconButton(
+                        icon: Icons.close,
+                        iconColor: theme.textSecondary,
+                        tooltip: MaterialLocalizations.of(context)
+                            .closeButtonTooltip,
+                        onPressed: _clearReplyTo,
+                        isCompact: true,
+                      ),
+                    ],
+                  ),
+                ),
+              RepaintBoundary(
+                child: ProviderScope(
+                  overrides: [
+                    composerDraftContextProvider.overrideWithValue(
+                      ephemeralComposerDraftContext(
+                        scope: 'channel',
+                        chatId: widget.channelId,
+                        session: (
+                          ref.watch(apiServiceProvider),
+                          ref.watch(openWebUiAuthSessionEpochProvider),
+                        ),
+                      ),
+                    ),
+                  ],
+                  child: ModernChatInput(
+                    onSendMessage: _sendMessage,
+                    placeholder: l10n.channelInputPlaceholder,
+                    overflowButtonBuilder: _buildAttachmentButton,
+                    bottomPadding: 0,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Resolves the avatar URL for a channel message.
+  ///
+  /// For model responses, builds the model profile image
+  /// URL. For user messages, resolves the user's profile
+  /// image URL.
+  String? _resolveAvatarUrl(ApiService? api, ChannelMessage message) {
+    if (isModelMessage(message)) {
+      final modelId = message.meta!['model_id'] as String?;
+      return buildModelAvatarUrl(api, modelId);
+    }
+    return resolveUserProfileImageUrl(api, message.user?.profileImageUrl);
+  }
+
+  /// Opens the interactive member list on every platform. The owner is captured
+  /// here, before anything is awaited, and travels with the sheet for as long as
+  /// it is open.
+  void _showMemberList() {
+    final owner = ChannelMembersOwner.capture(ref.read, widget.channelId);
+    if (owner == null) return;
+    unawaited(
+      ChannelMembersSheet.show(
+        context,
+        owner: owner,
+        onMembersChanged: () => unawaited(_refreshChannelDetails(owner)),
+      ),
+    );
+  }
+
+  /// Reads the channel again after a member change so the count in the toolbar
+  /// matches the server. The result is dropped unless the owner that changed
+  /// the members is still the one on screen.
+  Future<void> _refreshChannelDetails(ChannelMembersOwner owner) async {
+    bool stillOwned() =>
+        mounted &&
+        widget.channelId == owner.channelId &&
+        owner.isCurrent(ref.read);
+    if (!stillOwned()) return;
+    try {
+      final json = await owner.api.getChannel(
+        owner.channelId,
+        authSnapshot: owner.authSnapshot,
+      );
+      if (!stillOwned()) return;
+      ref.read(activeChannelProvider.notifier).set(Channel.fromJson(json));
+    } catch (e, s) {
+      developer.log(
+        'Failed to refresh channel after a member change',
+        name: 'ChannelPage',
+        error: e,
+        stackTrace: s,
+      );
+    }
+  }
+
+  void _handleChannelToolbarSelection(
+    String action,
+    Channel? channel, {
+    required bool muted,
+  }) {
+    switch (action) {
+      case 'notify-all':
+        unawaited(_setChannelMuted(false, current: muted));
+        return;
+      case 'notify-mentions':
+        unawaited(_setChannelMuted(true, current: muted));
+        return;
+      case 'edit':
+        if (channel != null) {
+          _editChannel(channel);
+        }
+        return;
+      case 'leave':
+        _leaveChannel();
+        return;
+      case 'delete':
+        _deleteChannel();
+        return;
+    }
+  }
+}
+
+class _ChannelToolbarPopupButton extends StatelessWidget {
+  const _ChannelToolbarPopupButton({
+    required this.tintColor,
+    required this.items,
+    required this.onSelected,
+  });
+
+  final Color tintColor;
+  final List<AdaptivePopupMenuEntry> items;
+  final ValueChanged<String> onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    return ConduitAdaptiveToolbarOverflowButton<String>(
+      tintColor: tintColor,
+      materialIcon: Icons.more_vert,
+      items: items,
+      onSelected: onSelected,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Message bubble
+// ---------------------------------------------------------------------------
+
+/// Renders a single channel message with avatar, metadata,
+/// content, and reaction chips.
+class _MessageBubble extends StatelessWidget {
+  const _MessageBubble({
+    required this.channelId,
+    required this.onAppReply,
+    required this.message,
+    this.avatarUrl,
+    this.showProfile = true,
+    required this.currentUserId,
+    required this.isEditing,
+    this.editController,
+    this.onSubmitEdit,
+    this.onCancelEdit,
+    required this.contextMenuActions,
+    required this.onReactionTap,
+    this.onThreadTap,
+  });
+
+  final String channelId;
+
+  /// Shows the private answer to a button on an app card.
+  final ValueChanged<AppChannelReplyEvent> onAppReply;
+  final ChannelMessage message;
+  final String? avatarUrl;
+
+  /// Whether to show the avatar and sender name.
+  /// False for consecutive messages from the same
+  /// sender.
+  final bool showProfile;
+  final String? currentUserId;
+  final bool isEditing;
+  final TextEditingController? editController;
+  final VoidCallback? onSubmitEdit;
+  final VoidCallback? onCancelEdit;
+  final List<ConduitContextMenuAction> contextMenuActions;
+  final ValueChanged<String> onReactionTap;
+  final VoidCallback? onThreadTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = context.conduitTheme;
+    final timestamp = _formatTimestamp(message.createdDateTime);
+
+    return ConduitContextMenu(
+      actions: contextMenuActions,
+      child: Padding(
+        padding: EdgeInsets.only(
+          left: Spacing.md,
+          right: Spacing.md,
+          top: showProfile ? Spacing.sm : 1,
+          bottom: 1,
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (showProfile)
+              _buildAvatar(theme)
+            else
+              SizedBox(width: _avatarSize),
+            const SizedBox(width: Spacing.sm),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (showProfile) ...[
+                    _buildHeader(theme, timestamp),
+                    const SizedBox(height: Spacing.xxs),
+                  ],
+                  if (message.replyToMessage != null)
+                    Container(
+                      margin: const EdgeInsets.only(bottom: Spacing.xxs),
+                      padding: const EdgeInsets.only(left: Spacing.sm),
+                      decoration: BoxDecoration(
+                        border: Border(
+                          left: BorderSide(
+                            color: Theme.of(context).colorScheme.primary,
+                            width: 2,
+                          ),
+                        ),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            message.replyToMessage!.userName,
+                            style: AppTypography.labelMediumStyle.copyWith(
+                              color: Theme.of(context).colorScheme.primary,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          Text(
+                            // A card-only app message has text only in its
+                            // cards.
+                            stripMentions(
+                              message.replyToMessage!.previewText,
+                            ),
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: AppTypography.bodySmallStyle.copyWith(
+                              color: theme.textSecondary,
+                            ),
+                          ),
+                        ],
+                      ),
+                    )
+                  else if (message.replyToId != null)
+                    Container(
+                      margin: const EdgeInsets.only(bottom: Spacing.xxs),
+                      padding: const EdgeInsets.only(left: Spacing.sm),
+                      decoration: BoxDecoration(
+                        border: Border(
+                          left: BorderSide(
+                            color: Theme.of(context).colorScheme.primary,
+                            width: 2,
+                          ),
+                        ),
+                      ),
+                      child: Text(
+                        AppLocalizations.of(context)!.channelMessageReply,
+                        style: AppTypography.bodySmallStyle.copyWith(
+                          color: theme.textSecondary,
+                          fontStyle: FontStyle.italic,
+                        ),
+                      ),
+                    ),
+                  if (message.isPinned)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: Spacing.xxs),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            Icons.push_pin_outlined,
+                            size: 14,
+                            color: theme.textPrimary.withValues(alpha: 0.6),
+                          ),
+                          const SizedBox(width: 4),
+                          Text(
+                            AppLocalizations.of(context)!.pinned,
+                            style: AppTypography.bodySmallStyle.copyWith(
+                              color: theme.textPrimary.withValues(alpha: 0.6),
+                              height: 1.3,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  if (isEditing)
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: editController,
+                            autofocus: true,
+                            style: AppTypography.chatMessageStyle.copyWith(
+                              color: theme.textPrimary,
+                            ),
+                            decoration: InputDecoration(
+                              isDense: true,
+                              contentPadding: const EdgeInsets.symmetric(
+                                horizontal: Spacing.sm,
+                                vertical: Spacing.xs,
+                              ),
+                              border: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                            ),
+                            onSubmitted: (_) => onSubmitEdit?.call(),
+                            magnifierConfiguration:
+                                nativeIosTextMagnifierConfiguration,
+                          ),
+                        ),
+                        ConduitIconButton(
+                          icon: Icons.check,
+                          tooltip: AppLocalizations.of(context)!.save,
+                          onPressed: onSubmitEdit,
+                          isCompact: true,
+                        ),
+                        ConduitIconButton(
+                          icon: Icons.close,
+                          tooltip: AppLocalizations.of(context)!.cancel,
+                          onPressed: onCancelEdit,
+                          isCompact: true,
+                        ),
+                      ],
+                    )
+                  else
+                    Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        ChannelMessageContent(
+                          content: message.content,
+                          stateScopeId: 'channel:${message.id}',
+                        ),
+                        ChannelMessageAttachments(
+                          files: message.data?['files'],
+                        ),
+                        if (message.isAppMessage)
+                          ChannelAppMessageCards(
+                            // Rows are reused by position; a button's state
+                            // stays with its message.
+                            key: ValueKey(message.id),
+                            message: message,
+                            channelId: channelId,
+                            onReply: onAppReply,
+                          ),
+                      ],
+                    ),
+                  if (message.replyCount > 0 && onThreadTap != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: Spacing.xxs),
+                      child: GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTap: onThreadTap,
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              '${message.replyCount} '
+                              '${message.replyCount == 1 ? "reply" : "replies"}',
+                              style: AppTypography.bodySmallStyle.copyWith(
+                                color: theme.textPrimary.withValues(alpha: 0.6),
+                                height: 1.3,
+                              ),
+                            ),
+                            const SizedBox(width: 4),
+                            Icon(
+                              Icons.chevron_right_rounded,
+                              size: 16,
+                              color: theme.textPrimary.withValues(alpha: 0.6),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  if (message.reactions.isNotEmpty)
+                    ChannelMessageReactions(
+                      reactions: message.reactions,
+                      currentUserId: currentUserId,
+                      onReactionTap: onReactionTap,
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  static const double _avatarSize = 28;
+
+  Widget _buildAvatar(ConduitThemeExtension theme) {
+    if (isModelMessage(message)) {
+      return ModelAvatar(
+        size: _avatarSize,
+        imageUrl: avatarUrl,
+        label: messageDisplayName(message),
+      );
+    }
+    if (message.isAppMessage) {
+      return ChannelAppAvatar(size: _avatarSize, imageUrl: avatarUrl);
+    }
+    return UserAvatar(
+      size: _avatarSize,
+      imageUrl: avatarUrl,
+      fallbackText: message.userName,
+    );
+  }
+
+  Widget _buildHeader(ConduitThemeExtension theme, String timestamp) {
+    return Row(
+      children: [
+        Flexible(
+          child: Text(
+            messageDisplayName(message),
+            style: AppTypography.bodySmallStyle.copyWith(
+              color: theme.textSecondary,
+              fontWeight: FontWeight.w500,
+              letterSpacing: 0.1,
+            ),
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+        if (message.isAppMessage) ...[
+          const SizedBox(width: Spacing.xs),
+          const ChannelAppBadge(),
+        ],
+        const SizedBox(width: Spacing.sm),
+        Text(
+          timestamp,
+          style: AppTypography.labelSmallStyle.copyWith(
+            color: theme.textSecondary,
+          ),
+        ),
+      ],
+    );
+  }
+
+  String _formatTimestamp(DateTime? dateTime) {
+    if (dateTime == null) return '';
+    final now = DateTime.now();
+    final diff = now.difference(dateTime);
+
+    if (diff.inMinutes < 1) return 'now';
+    if (diff.inHours < 1) return '${diff.inMinutes}m';
+    if (diff.inDays < 1) return '${diff.inHours}h';
+    if (diff.inDays < 7) return '${diff.inDays}d';
+
+    return '${dateTime.month}/${dateTime.day}';
+  }
+}

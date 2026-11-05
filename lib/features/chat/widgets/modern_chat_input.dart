@@ -1,0 +1,5804 @@
+import 'package:conduit/shared/widgets/platform_ui/platform_ui.dart';
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, ValueNotifier, kIsWeb, visibleForTesting;
+import 'package:material_ui/material_ui.dart';
+import 'package:cupertino_ui/cupertino_ui.dart';
+import 'package:flutter/scheduler.dart';
+import 'package:flutter/services.dart';
+import 'package:intl/intl.dart';
+import 'package:conduit/core/services/haptic_service.dart';
+
+import '../../../shared/theme/conduit_input_styles.dart';
+import '../../../shared/theme/theme_extensions.dart';
+
+// app_theme not required here; using theme extension tokens
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import 'dart:io' show Platform;
+import 'dart:async';
+
+import 'dart:math' as math;
+import 'dart:ui' as ui;
+
+import 'package:conduit_core/features/chat/composer/composer_commands.dart';
+import 'package:conduit_core/features/chat/providers/chat_providers.dart';
+import 'package:conduit_core/features/chat/services/chat_draft_queue.dart';
+import 'package:conduit_core/features/chat/providers/personal_valves_providers.dart';
+import 'package:conduit_core/features/integrations/providers/personal_connections_providers.dart';
+import 'package:conduit_core/features/terminal/providers/terminal_providers.dart';
+
+import '../services/clipboard_attachment_service.dart';
+import '../services/file_attachment_service.dart';
+import '../services/ios_native_paste_service.dart';
+import '../services/ios_keyboard_attachment_bridge.dart';
+import 'speech_playback_bar.dart';
+
+import 'package:conduit_core/features/chat/providers/context_attachments_provider.dart';
+import 'package:conduit_core/features/chat/providers/knowledge_cache_provider.dart';
+
+import '../../notes/providers/notes_providers.dart';
+
+import 'package:conduit_core/features/tools/providers/tools_providers.dart';
+
+import '../../prompts/providers/prompts_providers.dart';
+
+import 'package:conduit_core/features/hermes/controllers/hermes_busy_turn_controller.dart';
+
+import 'package:conduit_core/features/hermes/models/hermes_model.dart';
+import 'package:conduit_core/features/hermes/models/hermes_config.dart';
+import 'package:conduit_core/features/hermes/providers/hermes_providers.dart';
+import 'package:conduit_core/features/hermes/services/hermes_local_document_service.dart';
+import 'package:conduit_core/features/direct_connections/direct_connections.dart';
+import 'package:conduit_core/features/direct_connections/providers/direct_mcp_providers.dart';
+import 'package:conduit_core/features/direct_connections/controllers/direct_mcp_content_insertion.dart'
+    as core
+    show directMcpInsertionFitsComposer;
+import 'package:conduit_core/features/direct_connections/controllers/direct_mcp_content_insertion.dart'
+    show insertContentAtSelection;
+
+import '../../direct_connections/views/direct_mcp_content_sheet.dart';
+
+import 'package:conduit_core/features/workspace/models/workspace_resources.dart';
+
+import 'package:conduit_core/models/tool.dart';
+import 'package:conduit_core/models/model.dart';
+import 'package:conduit_core/models/prompt.dart';
+import 'package:conduit_core/models/toggle_filter.dart';
+
+import 'package:conduit_core/providers/app_providers.dart';
+
+import '../../../shared/services/navigation_service.dart';
+import '../../../core/services/native_sheet_bridge.dart';
+import '../services/native_stt_service.dart';
+
+import 'package:conduit_core/services/location_service.dart';
+
+import 'package:conduit_core/services/settings_service.dart';
+import 'package:conduit_core/utils/debug_logger.dart';
+
+import '../../chat/services/voice_input_service.dart';
+
+import 'package:conduit_core/models/knowledge_base.dart';
+import 'package:conduit_core/models/knowledge_base_file.dart';
+
+import '../../../shared/utils/platform_utils.dart';
+import '../../../shared/utils/adaptive_glass.dart';
+
+import 'package:conduit/l10n/app_localizations.dart';
+import 'package:conduit_core/providers/host_ports.dart';
+
+import '../../../shared/widgets/modal_safe_area.dart';
+import '../../../shared/widgets/model_avatar.dart';
+import '../../../shared/widgets/adaptive_toolbar_components.dart';
+import '../../../shared/widgets/themed_sheets.dart';
+import '../../../shared/widgets/horizontal_gesture_ownership.dart';
+import '../../../shared/widgets/horizontal_overflow_fade.dart';
+
+import 'package:conduit_core/utils/prompt_variable_parser.dart';
+
+import '../../prompts/widgets/prompt_variable_dialog.dart';
+
+import 'package:conduit_core/features/auth/providers/unified_auth_providers.dart';
+
+import '../controllers/composer_draft_binding.dart';
+import '../controllers/composer_recording_session.dart';
+import '../providers/composer_draft_provider.dart';
+import 'composer_recordings.dart';
+import 'chat_draft_queue_sheet.dart';
+import 'chat_input_intents.dart';
+import 'expanded_text_editor.dart';
+import 'chat_comparison_widgets.dart';
+import 'composer_overflow_items.dart';
+import 'composer_overflow_menu.dart';
+import 'mention_text_controller.dart';
+import 'personal_valves_sheet.dart';
+import 'model_suggestion_overlay.dart';
+import 'prompt_suggestion_overlay.dart';
+import 'skill_suggestion_overlay.dart';
+
+/// Native platform views are recomposited for every animated cursor-opacity
+/// frame. Keep the normal animated caret everywhere else, but use a discrete
+/// blink while the iOS 26 glass view is present.
+@visibleForTesting
+bool composerCursorOpacityAnimates({required bool usesNativePlatformView}) =>
+    !usesNativePlatformView;
+
+/// Whether the composer should delegate its edit menu to UIKit.
+@visibleForTesting
+bool composerUsesNativeSystemSelectionMenu({
+  required bool isIOS,
+  required bool systemMenuSupported,
+}) => isIOS && systemMenuSupported;
+
+@visibleForTesting
+TextEditingValue composerTextValueAfterInsertion(
+  TextEditingValue current,
+  String content,
+) {
+  final selection = current.selection;
+  final inserted = insertContentAtSelection(
+    current.text,
+    selectionStart: selection.isValid ? selection.start : null,
+    selectionEnd: selection.isValid ? selection.end : null,
+    content: content,
+  );
+  return TextEditingValue(
+    text: inserted.text,
+    selection: TextSelection.collapsed(offset: inserted.caret),
+    composing: TextRange.empty,
+  );
+}
+
+@visibleForTesting
+TextEditingValue composerTextValueAfterTranscription(
+  TextEditingValue current,
+  String content,
+) {
+  if (content.isEmpty) return current;
+  final text = current.text;
+  final separator = text.isEmpty || RegExp(r'\s$').hasMatch(text) ? '' : ' ';
+  return composerTextValueAfterInsertion(
+    current.copyWith(selection: TextSelection.collapsed(offset: text.length)),
+    '$separator$content',
+  );
+}
+
+@visibleForTesting
+bool directMcpInsertionFitsComposer(TextEditingValue current, String content) {
+  final selection = current.selection;
+  return core.directMcpInsertionFitsComposer(
+    current.text,
+    selectionStart: selection.isValid ? selection.start : null,
+    selectionEnd: selection.isValid ? selection.end : null,
+    content: content,
+  );
+}
+
+/// Returns a stable UIKit edit-menu model for the composer.
+///
+/// Keep composer actions limited to operations that mutate the editable field.
+/// In particular, "Ask Conduit" belongs to selected response text: adding it
+/// here both reinserted the selection into the same field and created a fresh
+/// callback identity whenever selection handles moved, forcing UIKit to
+/// re-present the menu.
+@visibleForTesting
+List<IOSSystemContextMenuItem> buildComposerSystemContextMenuItems({
+  required List<IOSSystemContextMenuItem> defaultItems,
+  required bool ensurePaste,
+}) {
+  final items = List<IOSSystemContextMenuItem>.from(defaultItems);
+  if (!ensurePaste ||
+      items.any((item) => item is IOSSystemContextMenuItemPaste)) {
+    return items;
+  }
+
+  final insertionIndex = items.indexWhere(
+    (item) =>
+        item is IOSSystemContextMenuItemSelectAll ||
+        item is IOSSystemContextMenuItemLookUp ||
+        item is IOSSystemContextMenuItemSearchWeb ||
+        item is IOSSystemContextMenuItemShare ||
+        item is IOSSystemContextMenuItemLiveText,
+  );
+  const pasteItem = IOSSystemContextMenuItemPaste();
+  if (insertionIndex >= 0) {
+    items.insert(insertionIndex, pasteItem);
+  } else {
+    items.add(pasteItem);
+  }
+  return items;
+}
+
+/// Whether the selected model may accept locally pasted/picked images.
+/// Reserved direct identities fail closed when their mutable registry binding
+/// has been removed or replaced.
+bool directModelAcceptsImageInput(Model? model, DirectModelRegistry registry) {
+  if (model == null || !hasReservedDirectIdentity(model)) return true;
+  return registry.resolve(model) != null && model.isMultimodal == true;
+}
+
+/// Restricts local file picking to what the selected transport can consume.
+///
+/// OpenWebUI performs server-backed document ingestion, while Hermes and
+/// Direct perform bounded local extraction. Direct also accepts image payloads
+/// when the selected model advertises multimodal input.
+List<String>? localFilePickerExtensionsForModel(
+  Model? selectedModel, {
+  bool desktopHermes = false,
+  bool hermesResponsesFiles = false,
+}) {
+  if (selectedModel == null) return null;
+  if (isHermesModel(selectedModel)) {
+    if (desktopHermes) return null;
+    final extensions = <String>{...kHermesLocalDocumentPickerExtensions};
+    if (hermesResponsesFiles) extensions.add('pdf');
+    return extensions.toList(growable: false)..sort();
+  }
+  if (hasReservedDirectIdentity(selectedModel)) {
+    final extensions = <String>{...kDirectLocalDocumentPickerExtensions};
+    if (selectedModel.capabilities?['pdf_input'] == true) {
+      extensions.add('pdf');
+    }
+    if (selectedModel.isMultimodal == true) {
+      extensions.addAll(
+        allSupportedImageFormats.map((extension) => extension.substring(1)),
+      );
+    }
+    return extensions.toList(growable: false)..sort();
+  }
+  return null;
+}
+
+/// Computes the height of the panel that replaces the visible IME.
+///
+/// The chat's outer safe area becomes active when Android hides the IME. The
+/// panel excludes that newly reserved region while retaining the small overlap
+/// needed to keep the composer on the same physical baseline.
+double fallbackAttachmentPanelHeight({
+  required double keyboardHeight,
+  required double bottomSafeInset,
+  required double retainedSafeAreaOverlap,
+  required double availableHeight,
+}) {
+  final effectiveSafeInset = (bottomSafeInset - retainedSafeAreaOverlap)
+      .clamp(0.0, double.infinity)
+      .toDouble();
+  if (keyboardHeight > 0) {
+    return (keyboardHeight - effectiveSafeInset)
+        .clamp(0.0, double.infinity)
+        .toDouble();
+  }
+
+  final preferredHeight = (availableHeight * 0.38)
+      .clamp(260.0, 320.0)
+      .toDouble();
+  return (preferredHeight - effectiveSafeInset)
+      .clamp(0.0, double.infinity)
+      .toDouble();
+}
+
+/// Shared visibility rule used by both compact and expanded '+' branches.
+bool shouldShowComposerOverflowButton({
+  required bool isHermesComposer,
+  required bool isDirectComposer,
+  required bool directSupportsImages,
+  bool directHasOverflowActions = false,
+  bool hermesHasLocalAttachmentActions = false,
+}) {
+  if (isHermesComposer) return hermesHasLocalAttachmentActions;
+  return !isDirectComposer || directSupportsImages || directHasOverflowActions;
+}
+
+/// Builds the actions rendered by the iOS keyboard attachment panel.
+///
+/// Kept platform-independent so its model-specific restrictions and action
+/// payload can be covered by widget tests without an iOS host process.
+List<IosKeyboardAttachmentActionConfig> buildIosKeyboardAttachmentActions({
+  required AppLocalizations l10n,
+  required ComposerOverflowAttachmentAvailability attachmentAvailability,
+  required bool hermesMode,
+  required bool directMode,
+  required bool webSearchAvailable,
+  required bool webSearchEnabled,
+  required bool imageGenerationAvailable,
+  required bool imageGenerationEnabled,
+  required List<Tool> availableTools,
+  required List<String> selectedToolIds,
+  required List<ToggleFilter> availableFilters,
+  required List<String> selectedFilterIds,
+  ComposerPersonalConnections connections = ComposerPersonalConnections.none,
+  bool toolSettingsAvailable = false,
+  bool compareModelsAvailable = false,
+  bool hasMessage = true,
+  CodeInterpreterOffer? codeInterpreter,
+}) {
+  final items = buildComposerOverflowItems(
+    l10n: l10n,
+    attachmentAvailability: attachmentAvailability,
+    // Web search is also a native Ollama Cloud capability. The availability
+    // provider has already resolved whether the active direct model can use it.
+    webSearchAvailable: !hermesMode && webSearchAvailable,
+    webSearchEnabled: webSearchEnabled,
+    imageGenerationAvailable: !hermesMode && imageGenerationAvailable,
+    imageGenerationEnabled: imageGenerationEnabled,
+    availableTools: hermesMode ? const <Tool>[] : availableTools,
+    selectedToolIds: selectedToolIds,
+    availableFilters: hermesMode || directMode
+        ? const <ToggleFilter>[]
+        : availableFilters,
+    selectedFilterIds: selectedFilterIds,
+    // Personal tool servers and terminals belong to the Open WebUI account.
+    connections: hermesMode || directMode
+        ? ComposerPersonalConnections.none
+        : connections,
+    // Personal valves are an Open WebUI server feature.
+    toolSettingsAvailable: !hermesMode && !directMode && toolSettingsAvailable,
+    // Comparing models is an Open WebUI server feature.
+    compareModelsAvailable:
+        !hermesMode && !directMode && compareModelsAvailable,
+    hasMessage: hasMessage,
+    codeInterpreter: codeInterpreter,
+  );
+
+  return items
+      .where((item) {
+        if (hermesMode) {
+          return item.enabled &&
+              (item.id == ComposerOverflowActionIds.file ||
+                  item.id == ComposerOverflowActionIds.photo ||
+                  item.id == ComposerOverflowActionIds.camera);
+        }
+        if (!directMode) {
+          return item.id != ComposerOverflowActionIds.mcpContent;
+        }
+        return item.enabled &&
+            (item.section == ComposerOverflowSection.tools ||
+                item.id == ComposerOverflowActionIds.file ||
+                item.id == ComposerOverflowActionIds.photo ||
+                item.id == ComposerOverflowActionIds.camera ||
+                item.id == ComposerOverflowActionIds.mcpContent ||
+                item.id == ComposerOverflowActionIds.webSearch ||
+                item.id == ComposerOverflowActionIds.imageGeneration);
+      })
+      .map(
+        (item) => IosKeyboardAttachmentActionConfig(
+          id: item.id,
+          label: item.label,
+          subtitle: item.subtitle,
+          sfSymbol: item.sfSymbol,
+          section: item.section.nativeValue,
+          // Headings come from the app's strings, never the native side.
+          sectionTitle: item.section.titleFor(l10n),
+          kind: item.kind == ComposerOverflowItemKind.toggle
+              ? IosKeyboardAttachmentActionKind.toggle
+              : IosKeyboardAttachmentActionKind.command,
+          stateLabel: item.kind == ComposerOverflowItemKind.toggle
+              ? (item.selected ? l10n.switchOnLabel : l10n.switchOffLabel)
+              : null,
+          enabled: item.enabled,
+          selected: item.selected,
+          dismissesKeyboard: item.dismissesKeyboard,
+        ),
+      )
+      .toList(growable: false);
+}
+
+class ModernChatInput extends ConsumerStatefulWidget {
+  final Function(String) onSendMessage;
+
+  /// Acknowledges admission before the composer retires its local draft.
+  final Future<ChatSendPlaceholderHandle?> Function(
+    String text,
+    void Function(ChatSendPlaceholderHandle) onPrepared,
+  )?
+  onSendDraft;
+
+  /// Sends the composer's message to several models as one comparison turn.
+  /// Null where the host cannot run one. Completes with the committed turn, or
+  /// null if it was not durably admitted; the composer keeps its draft unless
+  /// it was, and clears it only while it still shows the chat the turn is in.
+  final Future<ChatSendPlaceholderHandle?> Function(
+    String text,
+    List<Model> models,
+    void Function(ChatSendPlaceholderHandle) onPrepared,
+  )?
+  onCompareSend;
+  final bool enabled;
+  final double? bottomPadding;
+
+  /// Keeps the Android IME and attachment keyboard in one fixed bottom region.
+  ///
+  /// The containing scaffold must set [Scaffold.resizeToAvoidBottomInset] to
+  /// false when this is enabled.
+  final bool managesSystemKeyboardInset;
+
+  /// Optional placeholder text shown when the input is empty.
+  /// Falls back to the localised default ("Ask anything...").
+  final String? placeholder;
+
+  /// Builder that replaces the default overflow (+) button entirely.
+  /// Receives the button size so the replacement can match layout.
+  /// When provided, the default [ComposerAttachmentKeyboard] is not used.
+  final Widget Function(double size)? overflowButtonBuilder;
+  final Widget? attachedOverlay;
+
+  final Function()? onVoiceInput;
+  final Function()? onVoiceCall;
+  final Function()? onFileAttachment;
+  final Function()? onServerFileAttachment;
+  final Function()? onImageAttachment;
+  final Function()? onCameraCapture;
+  final Function()? onWebAttachment;
+
+  /// Callback invoked when images or files are pasted from clipboard.
+  final Future<void> Function(List<LocalAttachment>)? onPastedAttachments;
+
+  /// Target id for app-level text insertion requests.
+  ///
+  /// When null, this composer uses a private per-instance target so its own
+  /// text-selection menu can still insert back into itself without receiving
+  /// events meant for another composer.
+  final String? composerTextInsertionTargetId;
+
+  const ModernChatInput({
+    super.key,
+    required this.onSendMessage,
+    this.onSendDraft,
+    this.onCompareSend,
+    this.enabled = true,
+    this.bottomPadding,
+    this.managesSystemKeyboardInset = false,
+    this.placeholder,
+    this.overflowButtonBuilder,
+    this.attachedOverlay,
+    this.onVoiceInput,
+    this.onVoiceCall,
+    this.onFileAttachment,
+    this.onServerFileAttachment,
+    this.onImageAttachment,
+    this.onCameraCapture,
+    this.onWebAttachment,
+    this.onPastedAttachments,
+    this.composerTextInsertionTargetId,
+  });
+
+  @visibleForTesting
+  static TextStyle debugComposerInputTextStyle({required bool isRecording}) =>
+      _composerInputTextStyle(isRecording);
+
+  @override
+  ConsumerState<ModernChatInput> createState() => _ModernChatInputState();
+}
+
+// (Removed legacy _MicButton; inline mic logic now lives in primary button)
+
+TextStyle _composerInputTextStyle(bool isRecording) =>
+    AppTypography.chatMessageStyle.copyWith(
+      fontWeight: isRecording ? FontWeight.w500 : FontWeight.w400,
+      fontStyle: isRecording ? FontStyle.italic : FontStyle.normal,
+    );
+
+const double _maxCompactComposerControlScale = 1.25;
+const double _cupertinoComposerOverflowIconExtent = IconSize.large;
+const double _materialComposerOverflowIconExtent = 28;
+
+/// The account and the chat a comparison send was started in.
+typedef _ComposerOwner = ({
+  Object? api,
+  Object? epoch,
+  ChatMutationOwnerToken chat,
+});
+
+typedef _ComposerTypography = ({
+  ui.TextDirection direction,
+  TextScaler textScaler,
+  Locale? locale,
+  TextStyle style,
+  double scaledFontSize,
+  bool isRtl,
+});
+
+typedef _ComposerLayoutMetrics = ({
+  double width,
+  double scaledFontSize,
+  bool isRtl,
+  Locale? locale,
+  bool isRecording,
+});
+
+typedef _ComposerLineMeasurement = ({
+  String text,
+  _ComposerLayoutMetrics layout,
+  int lineCount,
+});
+
+typedef _CompactComposerControls = ({bool showLeading, bool showMic});
+
+/// Keeps a native composer button's platform-view widget stable while only
+/// unrelated composer state changes. The callback deliberately dereferences
+/// the latest widget so a new closure does not force UIKit reconfiguration.
+class _StableNativeComposerIconButton extends StatefulWidget {
+  const _StableNativeComposerIconButton({
+    super.key,
+    required this.onPressed,
+    required this.enabled,
+    required this.symbol,
+    required this.style,
+    required this.color,
+    required this.size,
+    required this.dimension,
+  });
+
+  final VoidCallback? onPressed;
+  final bool enabled;
+  final SFSymbol symbol;
+  final AdaptiveButtonStyle style;
+  final Color color;
+  final AdaptiveButtonSize size;
+  final double dimension;
+
+  @override
+  State<_StableNativeComposerIconButton> createState() =>
+      _StableNativeComposerIconButtonState();
+}
+
+class _StableNativeComposerIconButtonState
+    extends State<_StableNativeComposerIconButton> {
+  late Widget _nativeControl = _buildNativeControl();
+
+  @override
+  void didUpdateWidget(covariant _StableNativeComposerIconButton oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.enabled != widget.enabled ||
+        oldWidget.symbol.name != widget.symbol.name ||
+        oldWidget.symbol.size != widget.symbol.size ||
+        oldWidget.symbol.color != widget.symbol.color ||
+        oldWidget.style != widget.style ||
+        oldWidget.color != widget.color ||
+        oldWidget.size != widget.size ||
+        oldWidget.dimension != widget.dimension) {
+      _nativeControl = _buildNativeControl();
+    }
+  }
+
+  void _handlePressed() => widget.onPressed?.call();
+
+  Widget _buildNativeControl() {
+    return AdaptiveButton.sfSymbol(
+      onPressed: _handlePressed,
+      enabled: widget.enabled,
+      sfSymbol: widget.symbol,
+      style: widget.style,
+      color: widget.color,
+      size: widget.size,
+      minSize: Size.square(widget.dimension),
+      padding: EdgeInsets.zero,
+      borderRadius: BorderRadius.circular(widget.dimension),
+      useSmoothRectangleBorder: false,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => _nativeControl;
+}
+
+class _ModernChatInputState extends ConsumerState<ModernChatInput>
+    with TickerProviderStateMixin, WidgetsBindingObserver {
+  static const Duration _contextSuggestionDelay = Duration(milliseconds: 250);
+  static const int _maxContextSuggestionsPerType = 4;
+
+  // The expanded composer keeps a soft, pill-like corner.
+  static const double _composerRadius = AppBorderRadius.xl;
+  static const double _composerHorizontalInset = Spacing.sm;
+  static const double _composerControlSize = TouchTarget.minimum;
+  static const double _composerPrimaryVisualSize = 32;
+  static const double _composerActionRowBottomInset = 0;
+  static const double _composerTrailingAccessoryInset =
+      Spacing.xs + Spacing.xxs;
+  static int _nextGeneratedInsertionTargetId = 0;
+
+  final MentionTextEditingController _controller =
+      MentionTextEditingController();
+  final FocusNode _focusNode = FocusNode();
+  late final String _generatedInsertionTargetId =
+      'modern-chat-input-${_nextGeneratedInsertionTargetId++}';
+  String get _composerTextInsertionTargetId =>
+      widget.composerTextInsertionTargetId ?? _generatedInsertionTargetId;
+
+  /// Preserves the text field widget across parent shell swaps.
+  /// Without this, different parent ValueKeys cause Flutter to unmount and
+  /// remount the TextField, losing focus and keyboard state.
+  final GlobalKey _textFieldKey = GlobalKey();
+  double _compactTextFieldWidth = 0;
+  _ComposerLayoutMetrics? _composerLayoutMetrics;
+  _ComposerLayoutMetrics? _pendingComposerLayoutMetrics;
+  bool _composerLayoutMeasurementScheduled = false;
+  _ComposerLineMeasurement? _composerLineMeasurement;
+  BorderRadius? _cachedComposerGlassRadius;
+  Widget? _cachedComposerGlassBackdrop;
+  bool _pendingFocus = false;
+  bool _isRecording = false;
+
+  ComposerRecordingSession? _recordingSession;
+  String? _recordingTranscriptionErrorId;
+  String? _recordingCaptureErrorId;
+  ComposerDraftContext? _transcribingRecordingOwner;
+  bool _startingVoice = false;
+  int _voiceStartGeneration = 0;
+  // Server STT transcribes after the recording stops (manually or by voice
+  // activity detection); show that instead of leaving the composer stuck on
+  // "Recording…" (issue #707). Mirrors VoiceInputService.transcribing.
+  bool _isTranscribing = false;
+  ValueNotifier<bool>? _transcribingListenable;
+  bool _hasText = false; // track locally without rebuilding on each keystroke
+  bool _hasComposerFocus = false;
+  bool _isMultiline = false; // track multiline for dynamic border radius
+  /// Tracks the last time the user edited text, used to detect unexpected
+  /// focus loss during active typing (e.g. from widget tree restructures).
+  DateTime _lastEditTime = DateTime(0);
+
+  /// Counts edits to the composer text. A send that completes later may clear
+  /// the composer only if nothing was edited since it took the draft, even
+  /// when the text was typed back to what it was.
+  int _editGeneration = 0;
+  String _observedText = '';
+  ComposerDraftBinding? _draftBinding;
+  ChatSendPlaceholderHandle? _draftSendOwner;
+  bool _sendingDraft = false;
+  ProviderSubscription<ComposerDraftContext>? _draftSubscription;
+  StreamSubscription<String>? _voiceStreamSubscription;
+  final Object _nativePasteHandlerOwner = Object();
+  StreamSubscription<IosKeyboardAttachmentEvent>?
+  _keyboardAttachmentSubscription;
+  VoiceInputService? _voiceService;
+  StreamSubscription<void>? _textSub;
+  Timer? _contextSuggestionDebounce;
+  Timer? _skillSuggestionDebounce;
+  bool _isDeactivated = false;
+  int _lastHandledFocusTick = 0;
+  bool _showPromptOverlay = false;
+  bool _showExpandButton = false;
+  bool _expandModalOpen = false;
+  String _currentPromptCommand = '';
+  TextRange? _currentPromptRange;
+  int _promptSelectionIndex = 0;
+  bool _isContextSuggestionLoading = false;
+  List<_ComposerContextSuggestion> _contextSuggestions =
+      const <_ComposerContextSuggestion>[];
+  int _contextSuggestionRequestId = 0;
+  int _skillSuggestionRequestId = 0;
+  AsyncValue<List<WorkspaceSkillSummary>> _skillSuggestions = const AsyncData(
+    <WorkspaceSkillSummary>[],
+  );
+  bool _isNativeAttachmentPanelVisible = false;
+  // Account the personal connection rows in the native panel were built for,
+  // and the one the latest build produced. A native tap is applied only while
+  // the panel's account is still the signed-in one.
+  ComposerConnectionsOwner? _nativeConnectionsOwner;
+  ComposerConnectionsOwner? _builtNativeConnectionsOwner;
+  bool _nativeConnectionToggleBusy = false;
+  bool _isFallbackAttachmentPanelVisible = false;
+  bool _fallbackPanelReplacedKeyboard = false;
+  double _fallbackAttachmentPanelHeight = 300;
+  bool _fallbackPanelWaitingForKeyboard = false;
+  bool _desktopQueueActionBusy = false;
+
+  bool get _isRouteVisible =>
+      !ThemedSheets.isCoveredBySheet(context) &&
+      TickerMode.valuesOf(context).enabled &&
+      (ModalRoute.isCurrentOf(context) ?? true);
+
+  /// Service for handling clipboard paste operations.
+  final ClipboardAttachmentService _clipboardService =
+      ClipboardAttachmentService();
+
+  @override
+  void initState() {
+    super.initState();
+    ThemedSheets.activeSheetListenable.addListener(_handleActiveSheetChanged);
+
+    // Apply any prefilled text on first frame (focus handled via inputFocusTrigger)
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _isDeactivated) return;
+      final text = ref.read(prefilledInputTextProvider);
+      if (text != null && text.isNotEmpty) {
+        _controller.text = text;
+        _controller.selection = TextSelection.collapsed(offset: text.length);
+        // Clear after applying so it doesn't re-apply on rebuilds
+        ref.read(prefilledInputTextProvider.notifier).clear();
+      }
+    });
+
+    // Removed ref.listen here; it must be used from build in this Riverpod version
+
+    // Listen for text and selection changes in the composer
+    _observedText = _controller.text;
+    _controller.addListener(_handleComposerChanged);
+    WidgetsBinding.instance.addObserver(this);
+    _draftBinding = ComposerDraftBinding(
+      _controller,
+      onFailure: (loading, retry) {
+        if (!mounted || _isDeactivated) return;
+        final l10n = AppLocalizations.of(context)!;
+        AdaptiveSnackBar.show(
+          context,
+          message: loading
+              ? l10n.composerDraftLoadFailed
+              : l10n.composerDraftSaveFailed,
+          type: AdaptiveSnackBarType.error,
+          action: l10n.retry,
+          onActionPressed: retry,
+        );
+      },
+    );
+    _draftSubscription = ref.listenManual(composerDraftContextProvider, (
+      previous,
+      next,
+    ) {
+      if (previous != null &&
+          previous != next &&
+          (_isRecording || _startingVoice)) {
+        ++_voiceStartGeneration;
+        unawaited(_stopVoiceListening());
+      }
+      final nativeRemap =
+          previous != null &&
+          previous.owner.backend == 'hermes' &&
+          ref
+                  .read(activeConversationInPlaceRemapProvider)
+                  ?.matches(
+                    previous.chatId,
+                    next.chatId,
+                    namespace: ActiveConversationRemapNamespace.hermes,
+                  ) ==
+              true;
+      unawaited(
+        _draftBinding!.bind(
+          next,
+          remapped: nativeRemap,
+          preserveInput: _draftSendOwner?.ownsActiveChat(ref) == true,
+        ),
+      );
+    }, fireImmediately: true);
+
+    if (!kIsWeb && Platform.isIOS) {
+      IosNativePasteService.instance.registerHandler(
+        owner: _nativePasteHandlerOwner,
+        handler: _handleNativePastePayload,
+      );
+      _keyboardAttachmentSubscription = IosKeyboardAttachmentBridge
+          .instance
+          .events
+          .listen(_handleNativeKeyboardAttachmentEvent);
+    }
+
+    // Publish focus changes to listeners and guard against unexpected loss
+    // during active editing (e.g. widget tree restructure on expansion).
+    _focusNode.addListener(() {
+      if (!mounted || _isDeactivated) return;
+      final hasFocus = _focusNode.hasFocus;
+      if (hasFocus != _hasComposerFocus) {
+        setState(() {
+          _hasComposerFocus = hasFocus;
+        });
+      }
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || _isDeactivated) return;
+        final hasFocus = _focusNode.hasFocus;
+        // Publish composer focus state
+        try {
+          ref
+              .read(composerHasFocusProvider.notifier)
+              .set(hasFocus || _isFallbackAttachmentPanelVisible);
+        } catch (_) {}
+
+        // Dismissing the keyboard by tapping outside does not go through our
+        // toggle/hide path; clear native attachment state so the overflow icon
+        // returns to + when the panel is no longer on screen.
+        if (!hasFocus &&
+            !kIsWeb &&
+            Platform.isIOS &&
+            _isNativeAttachmentPanelVisible) {
+          unawaited(_hideNativeKeyboardAttachmentPanel());
+        }
+
+        // If focus was lost within 500ms of the last text edit, the user was
+        // actively typing and the loss was likely caused by a widget tree
+        // restructure (shell swap, parent rebuild from MeasureSize, etc.).
+        // Only restore when text is non-empty (excludes post-send clear),
+        // the widget is enabled, and autofocus hasn't been explicitly
+        // suppressed (excludes body tap / scroll dismiss).
+        if (!hasFocus &&
+            widget.enabled &&
+            !_expandModalOpen &&
+            !_isFallbackAttachmentPanelVisible &&
+            _controller.text.isNotEmpty &&
+            DateTime.now().difference(_lastEditTime).inMilliseconds < 500) {
+          final autofocusEnabled = ref.read(composerAutofocusEnabledProvider);
+          if (autofocusEnabled) {
+            _focusNode.requestFocus();
+          }
+        }
+      });
+    });
+
+    // Do not auto-focus on mount; only focus on explicit user intent
+  }
+
+  VoiceInputService get _voiceInputService {
+    final VoiceInputService service =
+        _voiceService ?? ref.read(voiceInputServiceProvider);
+    _voiceService = service;
+    return service;
+  }
+
+  @override
+  void dispose() {
+    // Note: Avoid using ref in dispose as per Riverpod best practices
+    // The focus state will be naturally cleared when the widget is disposed
+
+    unawaited(_draftBinding?.dispose());
+    WidgetsBinding.instance.removeObserver(this);
+    _draftSubscription?.close();
+    _controller.removeListener(_handleComposerChanged);
+    ThemedSheets.activeSheetListenable.removeListener(
+      _handleActiveSheetChanged,
+    );
+    _controller.dispose();
+    _focusNode.dispose();
+    _pendingFocus = false;
+    _voiceStreamSubscription?.cancel();
+    _transcribingListenable?.removeListener(_handleTranscribingChanged);
+    if (!kIsWeb && Platform.isIOS) {
+      IosNativePasteService.instance.unregisterHandler(
+        _nativePasteHandlerOwner,
+      );
+    }
+    _keyboardAttachmentSubscription?.cancel();
+    _textSub?.cancel();
+    _contextSuggestionDebounce?.cancel();
+    _skillSuggestionDebounce?.cancel();
+    if (!kIsWeb && Platform.isIOS) {
+      unawaited(IosKeyboardAttachmentBridge.instance.hide());
+    }
+    final voice = _voiceService;
+    final recording = _recordingSession;
+    unawaited(() async {
+      try {
+        await voice?.stopListening();
+      } finally {
+        await recording?.close();
+      }
+    }().catchError((Object _) {}));
+    super.dispose();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (!_fallbackPanelWaitingForKeyboard ||
+        !_isFallbackAttachmentPanelVisible) {
+      return;
+    }
+
+    final keyboardHeight = MediaQuery.viewInsetsOf(context).bottom;
+    final expectedKeyboardHeight = _fallbackAttachmentPanelHeight - Spacing.sm;
+    if (keyboardHeight + 1 < expectedKeyboardHeight) {
+      return;
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted ||
+          !_fallbackPanelWaitingForKeyboard ||
+          !_isFallbackAttachmentPanelVisible) {
+        return;
+      }
+      _dismissFallbackAttachmentPanel();
+    });
+  }
+
+  void _handleActiveSheetChanged() {
+    if (!mounted) return;
+    if (ThemedSheets.isCoveredBySheet(context) &&
+        _isFallbackAttachmentPanelVisible) {
+      _dismissFallbackAttachmentPanel();
+      return;
+    }
+    setState(() {});
+  }
+
+  void _ensureFocusedIfEnabled() {
+    // Respect global suppression flag to avoid re-opening keyboard
+    final autofocusEnabled = ref.read(composerAutofocusEnabledProvider);
+    final hasFocus = _focusNode.hasFocus;
+    if (!widget.enabled || hasFocus || _pendingFocus || !autofocusEnabled) {
+      return;
+    }
+
+    _pendingFocus = true;
+    // Request focus synchronously if we're already in a safe context,
+    // otherwise defer to next frame
+    if (WidgetsBinding.instance.schedulerPhase ==
+        SchedulerPhase.persistentCallbacks) {
+      // We're in a build/layout phase, defer to next frame
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _pendingFocus = false;
+        if (!widget.enabled) return;
+        if (!_focusNode.hasFocus) {
+          _focusNode.requestFocus();
+        }
+      });
+    } else {
+      // Safe to request focus immediately
+      _pendingFocus = false;
+      _focusNode.requestFocus();
+    }
+  }
+
+  @override
+  void deactivate() {
+    _isDeactivated = true;
+    super.deactivate();
+  }
+
+  @override
+  void activate() {
+    super.activate();
+    _isDeactivated = false;
+  }
+
+  @override
+  void didUpdateWidget(covariant ModernChatInput oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Avoid auto-focusing when becoming enabled; wait for user intent
+    if (!widget.enabled && oldWidget.enabled) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || _isDeactivated) return;
+        if (_isFallbackAttachmentPanelVisible) {
+          _dismissFallbackAttachmentPanel();
+        }
+        if (_focusNode.hasFocus) {
+          _focusNode.unfocus();
+        }
+      });
+    }
+  }
+
+  /// Whether the typed message would be queued behind the running response
+  /// rather than sent. Enter, the expanded editor's Send and the Queue action
+  /// all follow it, so none of them starts a second turn mid-response.
+  bool get _queuesInsteadOfSending => ref.read(chatDraftQueueOfferProvider);
+
+  /// Queues what is typed, with the composer's files, and clears the composer.
+  /// A draft the queue refuses (the response just ended) leaves it untouched.
+  /// Queueing is a send, so it is felt once, as one, whichever way it came.
+  void _queueDraft() {
+    final text = _controller.text.trim();
+    if (text.isEmpty || !widget.enabled) return;
+    final wireText = _controller.toWireFormat().trim();
+    final queue = ref.read(chatDraftQueueProvider.notifier);
+    if (queue.enqueue(wireText) == null) return;
+    ConduitHaptics.mediumImpact();
+    _controller.clearMentions();
+    _controller.clear();
+    _focusNode.requestFocus();
+    // Drafts do not survive a restart, so say so once per session.
+    if (queue.takeLifetimeNotice() && mounted) {
+      AdaptiveSnackBar.show(
+        context,
+        message: AppLocalizations.of(context)!.queuedDraftsSessionNote,
+        type: AdaptiveSnackBarType.info,
+        duration: const Duration(seconds: 5),
+      );
+    }
+  }
+
+  bool get _isRecoveringRecording =>
+      _transcribingRecordingOwner != null &&
+      _transcribingRecordingOwner == ref.read(composerDraftContextProvider);
+
+  void _sendMessage() {
+    if (_startingVoice || _isTranscribing || _isRecoveringRecording) return;
+    if (_isRecording) {
+      unawaited(_stopVoice());
+      return;
+    }
+    final text = _controller.text.trim();
+    if (text.isEmpty || !widget.enabled) return;
+    if (_queuesInsteadOfSending) {
+      _queueDraft();
+      return;
+    }
+    // A project draft that starts with two saved models sends to both, through
+    // the same committed-turn path as the Compare command. A host that cannot
+    // admit a comparison sends the message the ordinary way.
+    final saved = ref.read(folderDraftComparisonModelsProvider);
+    if (saved != null && widget.onCompareSend != null) {
+      unawaited(_sendComparison(saved, _captureComposerOwner()));
+      return;
+    }
+
+    final sendDraft = widget.onSendDraft;
+    if (sendDraft != null) {
+      unawaited(_sendOwnedDraft(_captureComposerOwner(), sendDraft));
+      return;
+    }
+
+    // Convert @mentions to OpenWebUI wire format
+    // (e.g. @GPT-4 → <@M:gpt-4|GPT-4>) before sending.
+    final wireText = _controller.toWireFormat().trim();
+
+    widget.onSendMessage(wireText);
+    _controller.clearMentions();
+    _controller.clear();
+    _focusNode.unfocus();
+    unawaited(_hideAttachmentPanels());
+    try {
+      SystemChannels.textInput.invokeMethod('TextInput.hide');
+    } catch (_) {
+      // Silently handle if keyboard dismissal fails
+    }
+  }
+
+  Future<void> _sendDesktopBusyMessage({required bool steer}) async {
+    if (!widget.enabled || _isRecording || _desktopQueueActionBusy) return;
+    final text = _controller.toWireFormat().trim();
+    if (text.isEmpty) return;
+    setState(() => _desktopQueueActionBusy = true);
+    try {
+      final accepted = await ref
+          .read(hermesBusyTurnControllerProvider)
+          .submit(
+            action: steer
+                ? HermesBusyTurnAction.steer
+                : HermesBusyTurnAction.sendNext,
+            text: text,
+            localStreaming: ref.read(isChatStreamingProvider),
+          );
+      if (!mounted || !accepted) return;
+      if (_controller.toWireFormat().trim() != text) return;
+      _controller.clearMentions();
+      _controller.clear();
+      _focusNode.requestFocus();
+    } finally {
+      if (mounted) setState(() => _desktopQueueActionBusy = false);
+    }
+  }
+
+  void _handleNativeKeyboardAttachmentEvent(IosKeyboardAttachmentEvent event) {
+    if (!mounted || _isDeactivated) return;
+
+    switch (event) {
+      case IosKeyboardAttachmentVisibilityChanged(:final visible):
+        if (_isNativeAttachmentPanelVisible != visible) {
+          setState(() => _isNativeAttachmentPanelVisible = visible);
+        }
+      case IosKeyboardAttachmentAction(:final id):
+        _handleNativeKeyboardAttachmentAction(id);
+    }
+  }
+
+  void _handleNativeKeyboardAttachmentAction(String id) {
+    if (!mounted || _isDeactivated) return;
+    final availability = _overflowAttachmentAvailability;
+
+    switch (id) {
+      case ComposerOverflowActionIds.file:
+        if (availability.file) widget.onFileAttachment?.call();
+        return;
+      case ComposerOverflowActionIds.serverFile:
+        if (availability.serverFile) widget.onServerFileAttachment?.call();
+        return;
+      case ComposerOverflowActionIds.photo:
+        if (availability.photo) widget.onImageAttachment?.call();
+        return;
+      case ComposerOverflowActionIds.camera:
+        if (availability.camera) widget.onCameraCapture?.call();
+        return;
+      case ComposerOverflowActionIds.web:
+        if (availability.web) widget.onWebAttachment?.call();
+        return;
+      case ComposerOverflowActionIds.mcpContent:
+        if (availability.mcpContent) unawaited(_openDirectMcpContent());
+        return;
+      case ComposerOverflowActionIds.toolSettings:
+        _openToolSettings();
+        return;
+      case ComposerOverflowActionIds.compareModels:
+        // The same command the Flutter menu runs: one controller for both.
+        unawaited(_openCompareModels());
+        return;
+      default:
+        if (isComposerConnectionAction(id)) {
+          unawaited(_toggleNativeConnection(id));
+          return;
+        }
+        toggleComposerOverflowSelection(ref, id);
+        return;
+    }
+  }
+
+  Future<void> _toggleNativeConnection(String id) async {
+    // A second tap while a terminal change is still being saved would read the
+    // old selection and repeat the same change, so it is ignored.
+    if (_nativeConnectionToggleBusy) return;
+    _nativeConnectionToggleBusy = true;
+    try {
+      await toggleComposerConnectionSelection(
+        ref,
+        id,
+        opened: _nativeConnectionsOwner,
+      );
+    } catch (error) {
+      DebugLogger.error(
+        'native-connection-toggle-failed',
+        scope: 'chat/composer',
+        error: error,
+      );
+    } finally {
+      _nativeConnectionToggleBusy = false;
+    }
+  }
+
+  /// Handles content insertion from keyboard/clipboard (images, files).
+  ///
+  /// This is called when the user pastes rich content into the text field
+  /// on iOS and Android.
+  Future<void> _handleContentInserted(KeyboardInsertedContent content) async {
+    if (!widget.enabled || !_selectedModelAcceptsImageInput) return;
+
+    // Check if we have a callback to handle pasted attachments
+    final onPasted = widget.onPastedAttachments;
+    if (onPasted == null) return;
+
+    final mimeType = content.mimeType;
+    final data = content.data;
+
+    // Only process image content
+    if (!_clipboardService.isSupportedImageType(mimeType)) {
+      return;
+    }
+
+    // Check if we have actual data
+    if (data == null || data.isEmpty) {
+      return;
+    }
+
+    PlatformUtils.lightHaptic();
+
+    // Create attachment from pasted image data
+    String? suggestedName;
+    final uriString = content.uri;
+    if (uriString.isNotEmpty) {
+      try {
+        final uri = Uri.parse(uriString);
+        if (uri.pathSegments.isNotEmpty) {
+          suggestedName = uri.pathSegments.last;
+        }
+      } catch (_) {
+        // Ignore URI parsing errors
+      }
+    }
+    final attachment = await _clipboardService.createAttachmentFromImageData(
+      imageData: data,
+      mimeType: mimeType,
+      suggestedFileName: suggestedName,
+    );
+
+    if (attachment != null) {
+      await onPasted([attachment]);
+    }
+  }
+
+  Future<void> _handleNativePastePayload(
+    IosNativePastePayload payload,
+    IosNativePasteDispatchLease lease,
+  ) async {
+    if (!mounted ||
+        _isDeactivated ||
+        !widget.enabled ||
+        !_focusNode.hasFocus ||
+        !_selectedModelAcceptsImageInput) {
+      return;
+    }
+
+    if (widget.onPastedAttachments == null) {
+      return;
+    }
+
+    switch (payload) {
+      case IosNativeTextPaste():
+        return;
+      case IosNativeImagePaste(:final deliveryId, :final items):
+        if (!isValidIosNativePasteDeliveryId(deliveryId)) return;
+        final prepared = await _clipboardService.prepareNativePasteAttachments(
+          deliveryId: deliveryId!,
+          items: items,
+        );
+        // Native still owns every file and will reclaim the complete delivery
+        // when any marker, path, link, item name, or size is invalid.
+        if (prepared == null) return;
+        if (!mounted ||
+            _isDeactivated ||
+            !widget.enabled ||
+            !_focusNode.hasFocus ||
+            !_selectedModelAcceptsImageInput) {
+          return;
+        }
+        final currentOnPasted = widget.onPastedAttachments;
+        if (currentOnPasted == null) return;
+
+        // `Future.timeout` does not cancel this handler. Cross the ownership
+        // boundary only through the delivery lease, immediately before the
+        // callback synchronously adds the files to composer state. Once that
+        // transfer succeeds, upload preparation may safely continue in the
+        // background without delaying the native acknowledgement.
+        lease.tryCommit(() {
+          _clipboardService.claimNativePasteSync(prepared, (attachments) {
+            unawaited(
+              currentOnPasted(attachments)
+                  .catchError((Object error, StackTrace stackTrace) {
+                    DebugLogger.error(
+                      'Native pasted attachment processing failed',
+                      scope: 'clipboard/native-paste',
+                      error: error,
+                      stackTrace: stackTrace,
+                    );
+                  }),
+            );
+          });
+        });
+        return;
+      case IosNativeUnsupportedPaste():
+        return;
+    }
+  }
+
+  Widget _buildIosContextMenu(
+    BuildContext context,
+    EditableTextState editableTextState,
+  ) {
+    final useSystemMenu = composerUsesNativeSystemSelectionMenu(
+      isIOS: !kIsWeb && Platform.isIOS,
+      systemMenuSupported: SystemContextMenu.isSupportedByField(
+        editableTextState,
+      ),
+    );
+    if (useSystemMenu) {
+      return SystemContextMenu.editableText(
+        editableTextState: editableTextState,
+        items: _buildIosSystemContextMenuItems(editableTextState),
+      );
+    }
+
+    return _buildFallbackContextMenu(context, editableTextState);
+  }
+
+  List<IOSSystemContextMenuItem> _buildIosSystemContextMenuItems(
+    EditableTextState editableTextState,
+  ) {
+    return buildComposerSystemContextMenuItems(
+      defaultItems: SystemContextMenu.getDefaultItems(editableTextState),
+      ensurePaste:
+          widget.onPastedAttachments != null && _selectedModelAcceptsImageInput,
+    );
+  }
+
+  /// Builds a Flutter-rendered fallback text editing menu.
+  Widget _buildFallbackContextMenu(
+    BuildContext context,
+    EditableTextState editableTextState,
+  ) {
+    final buttonItems = _buildFallbackContextMenuItems(
+      context,
+      editableTextState,
+    );
+    return AdaptiveTextSelectionToolbar.buttonItems(
+      anchors: editableTextState.contextMenuAnchors,
+      buttonItems: buttonItems,
+    );
+  }
+
+  List<ContextMenuButtonItem> _buildFallbackContextMenuItems(
+    BuildContext context,
+    EditableTextState editableTextState,
+  ) {
+    final items = List<ContextMenuButtonItem>.from(
+      editableTextState.contextMenuButtonItems,
+    );
+
+    if (!kIsWeb &&
+        Platform.isIOS &&
+        widget.onPastedAttachments != null &&
+        _selectedModelAcceptsImageInput) {
+      final pasteIndex = items.indexWhere(
+        (item) => item.type == ContextMenuButtonType.paste,
+      );
+      if (pasteIndex >= 0) {
+        final defaultPaste = items[pasteIndex];
+        items[pasteIndex] = ContextMenuButtonItem(
+          type: defaultPaste.type,
+          label: defaultPaste.label,
+          onPressed: () {
+            unawaited(
+              _handleFallbackPaste(
+                editableTextState,
+                defaultPaste: defaultPaste.onPressed,
+              ),
+            );
+          },
+        );
+      } else {
+        items.add(
+          ContextMenuButtonItem(
+            type: ContextMenuButtonType.paste,
+            label: MaterialLocalizations.of(context).pasteButtonLabel,
+            onPressed: () {
+              unawaited(_handleFallbackPaste(editableTextState));
+            },
+          ),
+        );
+      }
+    }
+
+    return items;
+  }
+
+  Future<void> _handleFallbackPaste(
+    EditableTextState editableTextState, {
+    VoidCallback? defaultPaste,
+  }) async {
+    if (!mounted || !widget.enabled) {
+      return;
+    }
+
+    if (!_selectedModelAcceptsImageInput) {
+      defaultPaste?.call();
+      return;
+    }
+
+    final handledImagePaste = await IosNativePasteService.instance
+        .requestPaste();
+    if (handledImagePaste) {
+      editableTextState.hideToolbar();
+      return;
+    }
+
+    defaultPaste?.call();
+  }
+
+  void _insertNewline() {
+    final text = _controller.text;
+    TextSelection sel = _controller.selection;
+    final int start = sel.isValid ? sel.start : text.length;
+    final int end = sel.isValid ? sel.end : text.length;
+    final String before = text.substring(0, start);
+    final String after = text.substring(end);
+    final String updated = '$before\n$after';
+    _controller.value = TextEditingValue(
+      text: updated,
+      selection: TextSelection.collapsed(offset: before.length + 1),
+      composing: TextRange.empty,
+    );
+    // Ensure field stays focused
+    _ensureFocusedIfEnabled();
+  }
+
+  void _recordingTranscribingChanged(ComposerDraftContext owner, bool busy) {
+    if (!mounted || (!busy && _transcribingRecordingOwner != owner)) return;
+    setState(() => _transcribingRecordingOwner = busy ? owner : null);
+  }
+
+  void _appendRecordingTranscription(String content) {
+    if (_recordingTranscriptionErrorId != null) {
+      setState(() => _recordingTranscriptionErrorId = null);
+    }
+    _controller.value = composerTextValueAfterTranscription(
+      _controller.value,
+      content,
+    );
+    _ensureFocusedIfEnabled();
+  }
+
+  void _insertTextAtCurrentSelection(String content) {
+    if (content.isEmpty) {
+      return;
+    }
+
+    _controller.value = composerTextValueAfterInsertion(
+      _controller.value,
+      content,
+    );
+    _ensureFocusedIfEnabled();
+  }
+
+  /// Opens personal tool settings for both the native iOS keyboard menu and
+  /// the Flutter overflow panel. The account owner is captured inside
+  /// [showPersonalToolSettings] before anything here awaits or dismisses.
+  /// The chosen code interpreter cannot run this turn: says why, and offers to
+  /// turn it off, which a tap on a working pill does directly.
+  void _explainBlockedCodeInterpreter(String reason) {
+    final l10n = AppLocalizations.of(context)!;
+    AdaptiveSnackBar.show(
+      context,
+      message: reason,
+      type: AdaptiveSnackBarType.warning,
+      action: l10n.codeInterpreterTurnOff,
+      onActionPressed: () => setComposerOverflowSelection(
+        ref,
+        actionId: ComposerOverflowActionIds.codeInterpreter,
+        selected: false,
+      ),
+    );
+  }
+
+  void _openToolSettings() {
+    if (!mounted || _isDeactivated) return;
+    unawaited(showPersonalToolSettings(context, ref));
+    _dismissFallbackAttachmentPanel();
+  }
+
+  /// Whether this composer offers "Compare models": the command is available,
+  /// and the screen hosting it can admit a comparison turn. [read] is
+  /// `ref.read` or `ref.watch`.
+  bool _comparisonCommandAvailable(dynamic read) =>
+      widget.onCompareSend != null &&
+      (read(comparisonCommandAvailableProvider) as bool);
+
+  /// "Compare models": asks which models, then sends the composer's message to
+  /// all of them as one turn. Both the Flutter menu and the native iOS panel
+  /// land here.
+  Future<void> _openCompareModels() async {
+    if (!mounted || _isDeactivated || !widget.enabled) return;
+    if (!_comparisonCommandAvailable(ref.read)) return;
+    final l10n = AppLocalizations.of(context)!;
+    _dismissFallbackAttachmentPanel();
+    final draft = _controller.text.trim();
+    if (draft.isEmpty) {
+      AdaptiveSnackBar.show(
+        context,
+        message: l10n.chatCompareNeedsMessage,
+        type: AdaptiveSnackBarType.info,
+      );
+      return;
+    }
+    await _hideNativeKeyboardAttachmentPanel();
+    if (!mounted || _isDeactivated) return;
+    final owner = _captureComposerOwner();
+    final models = await showComparisonSetupSheet(context, ref);
+    await _sendComparison(models, owner);
+  }
+
+  /// The account and the chat this composer is showing, named before anything
+  /// awaits. A new chat has no conversation yet.
+  _ComposerOwner _captureComposerOwner() => (
+    api: ref.read(apiServiceProvider),
+    epoch: ref.read(openWebUiAuthSessionEpochProvider),
+    chat: captureChatMutationOwner(ref, ref.read(activeConversationProvider)),
+  );
+
+  /// Sends the composer's message to [models] as one comparison turn and clears
+  /// the composer once that turn is committed. [models] is null when the user
+  /// chose none. The setup command and a project draft that starts with saved
+  /// models both send through here.
+  Future<void> _sendComparison(
+    List<Model>? models,
+    _ComposerOwner owner,
+  ) async {
+    if (models == null) return;
+    final send = widget.onCompareSend;
+    if (send == null) return;
+    await _sendOwnedDraft(
+      owner,
+      (text, onPrepared) => send(text, models, onPrepared),
+    );
+  }
+
+  Future<void> _sendOwnedDraft(
+    _ComposerOwner owner,
+    Future<ChatSendPlaceholderHandle?> Function(
+      String,
+      void Function(ChatSendPlaceholderHandle),
+    )
+    send,
+  ) async {
+    if (_sendingDraft) return;
+    _sendingDraft = true;
+    try {
+      await _admitOwnedDraft(owner, send);
+    } catch (_) {
+      if (mounted) {
+        AdaptiveSnackBar.show(
+          context,
+          message: AppLocalizations.of(context)!.errorMessage,
+          type: AdaptiveSnackBarType.error,
+        );
+      }
+    } finally {
+      _sendingDraft = false;
+      _draftSendOwner = null;
+    }
+  }
+
+  Future<void> _admitOwnedDraft(
+    _ComposerOwner owner,
+    Future<ChatSendPlaceholderHandle?> Function(
+      String,
+      void Function(ChatSendPlaceholderHandle),
+    )
+    send,
+  ) async {
+    bool sameAccount() =>
+        mounted &&
+        !_isDeactivated &&
+        identical(ref.read(apiServiceProvider), owner.api) &&
+        identical(ref.read(openWebUiAuthSessionEpochProvider), owner.epoch);
+    // The turn goes to whichever chat is active when it is sent, so the chat
+    // the user composed in must still be it.
+    if (!sameAccount() || !chatMutationTokenStillActive(ref, owner.chat)) {
+      return;
+    }
+    final wireText = _controller.toWireFormat().trim();
+    if (wireText.isEmpty || !widget.enabled) return;
+    // Edits made after this point belong to a newer draft.
+    final draftGeneration = _editGeneration;
+    // The draft is the user's until the turn is durably admitted: a refusal
+    // leaves its text, mentions and attachments exactly where they are.
+    final originDraft = ref.read(composerDraftContextProvider);
+    final sentSnapshot = _controller.snapshotDraft();
+    final recordings = originDraft.temporary || originDraft.store == null
+        ? const <String>[]
+        : (await originDraft.store!.recordings
+                  .watch(originDraft.scope, originDraft.chatId)
+                  .first)
+              .map((item) => item.id)
+              .toList();
+    if (!sameAccount() || !chatMutationTokenStillActive(ref, owner.chat)) {
+      return;
+    }
+    final committed = await send(
+      wireText,
+      (handle) => _draftSendOwner = handle,
+    );
+    if (committed != null) {
+      await _draftBinding?.markSent(originDraft, sentSnapshot);
+      try {
+        for (final id in recordings) {
+          await originDraft.store?.recordings.discard(id);
+        }
+      } catch (_) {
+        if (mounted) {
+          AdaptiveSnackBar.show(
+            context,
+            message: AppLocalizations.of(context)!.recordingDiscardFailed,
+            type: AdaptiveSnackBarType.error,
+          );
+        }
+      }
+    }
+    // Clear only the composer that sent the turn: same account, showing the
+    // chat the turn went into, and not edited since.
+    if (committed == null ||
+        !sameAccount() ||
+        !committed.ownsActiveChat(ref) ||
+        draftGeneration != _editGeneration) {
+      return;
+    }
+    _controller.clearMentions();
+    _controller.clear();
+    _focusNode.unfocus();
+    unawaited(_hideAttachmentPanels());
+    try {
+      SystemChannels.textInput.invokeMethod('TextInput.hide');
+    } catch (_) {
+      // Silently handle if keyboard dismissal fails
+    }
+  }
+
+  Future<void> _openDirectMcpContent() async {
+    if (!widget.enabled) return;
+    final selection = _controller.selection;
+    _dismissFallbackAttachmentPanel();
+    await _hideNativeKeyboardAttachmentPanel();
+    if (!mounted || _isDeactivated) return;
+    final content = await DirectMcpContentSheet.show(context);
+    if (!mounted ||
+        _isDeactivated ||
+        !widget.enabled ||
+        content == null ||
+        content.isEmpty) {
+      return;
+    }
+    final restored = _controller.value.copyWith(selection: selection);
+    if (!directMcpInsertionFitsComposer(restored, content)) {
+      AdaptiveSnackBar.show(
+        context,
+        message: AppLocalizations.of(context)!.directMcpContentComposerTooLarge,
+        type: AdaptiveSnackBarType.error,
+      );
+      return;
+    }
+    _controller.value = composerTextValueAfterInsertion(restored, content);
+    _ensureFocusedIfEnabled();
+  }
+
+  _ComposerTypography _composerTypography(BuildContext context) {
+    final direction = Directionality.of(context);
+    final textScaler = MediaQuery.textScalerOf(context);
+    final locale = Localizations.maybeLocaleOf(context);
+    final style = _composerInputTextStyle(_isRecording);
+    return (
+      direction: direction,
+      textScaler: textScaler,
+      locale: locale,
+      style: style,
+      scaledFontSize: textScaler.scale(style.fontSize ?? 14),
+      isRtl: direction == ui.TextDirection.rtl,
+    );
+  }
+
+  bool _shouldShowComposerExpandButton(int lineCount) => lineCount >= 4;
+
+  _CompactComposerControls _compactComposerControls({
+    required bool showOverflowButton,
+    required bool voiceAvailable,
+    required bool isGenerating,
+  }) => (
+    showLeading: _isRecording || showOverflowButton,
+    showMic: !_isRecording && !_hasText && voiceAvailable && !isGenerating,
+  );
+
+  void _scheduleComposerLineMeasurement(
+    BuildContext context,
+    double compactTextFieldWidth,
+  ) {
+    if (!compactTextFieldWidth.isFinite || compactTextFieldWidth <= 0) return;
+
+    final typography = _composerTypography(context);
+    final metrics = (
+      width: compactTextFieldWidth,
+      scaledFontSize: typography.scaledFontSize,
+      isRtl: typography.isRtl,
+      locale: typography.locale,
+      isRecording: _isRecording,
+    );
+    if (metrics == _composerLayoutMetrics &&
+        _pendingComposerLayoutMetrics == null) {
+      return;
+    }
+
+    _pendingComposerLayoutMetrics = metrics;
+    if (_composerLayoutMeasurementScheduled) return;
+    _composerLayoutMeasurementScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _composerLayoutMeasurementScheduled = false;
+      final pendingMetrics = _pendingComposerLayoutMetrics;
+      _pendingComposerLayoutMetrics = null;
+      if (!mounted || _isDeactivated || pendingMetrics == null) return;
+
+      _composerLayoutMetrics = pendingMetrics;
+      _compactTextFieldWidth = pendingMetrics.width;
+      _recomputeComposerLineState();
+    });
+  }
+
+  void _recomputeComposerLineState() {
+    final text = _controller.text;
+    final l10n = AppLocalizations.of(context)!;
+    final layoutText = text.isNotEmpty
+        ? text
+        : _isTranscribing
+        ? l10n.transcribingAudio
+        : _isRecording
+        ? l10n.recordingAudio
+        : widget.placeholder ?? l10n.messageHintText;
+    final lineCount = _composerTextLineCount(layoutText);
+    final isMultiline = lineCount > 1;
+    final showExpand = _shouldShowComposerExpandButton(lineCount);
+    if (isMultiline == _isMultiline && showExpand == _showExpandButton) {
+      return;
+    }
+
+    setState(() {
+      _isMultiline = isMultiline;
+      _showExpandButton = showExpand;
+    });
+  }
+
+  int _composerTextLineCount(String text) {
+    if (text.isEmpty) return 0;
+    if (_compactTextFieldWidth <= 0) return text.split('\n').length;
+
+    final typography = _composerTypography(context);
+    final layout = (
+      width: _compactTextFieldWidth,
+      scaledFontSize: typography.scaledFontSize,
+      isRtl: typography.isRtl,
+      locale: typography.locale,
+      isRecording: _isRecording,
+    );
+    final cached = _composerLineMeasurement;
+    if (cached != null && cached.text == text && cached.layout == layout) {
+      return cached.lineCount;
+    }
+
+    final painter = TextPainter(
+      text: TextSpan(text: text, style: typography.style),
+      textDirection: typography.direction,
+      textScaler: typography.textScaler,
+      locale: typography.locale,
+      maxLines: 4,
+    );
+    try {
+      painter.layout(maxWidth: _compactTextFieldWidth);
+      final lineCount = painter.didExceedMaxLines
+          ? 4
+          : painter.computeLineMetrics().length;
+      _composerLineMeasurement = (
+        text: text,
+        layout: layout,
+        lineCount: lineCount,
+      );
+      return lineCount;
+    } finally {
+      painter.dispose();
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      unawaited(_draftBinding?.flush());
+      unawaited(_recordingSession?.flush().catchError((Object _) {}));
+    }
+  }
+
+  void _handleComposerChanged() {
+    if (_controller.text != _observedText) {
+      _observedText = _controller.text;
+      _editGeneration++;
+    }
+    if (!mounted || _isDeactivated) return;
+    _lastEditTime = DateTime.now();
+
+    final String text = _controller.text;
+    final TextSelection selection = _controller.selection;
+    final bool hasText = text.trim().isNotEmpty;
+    final l10n = AppLocalizations.of(context)!;
+    final layoutText = text.isNotEmpty
+        ? text
+        : _isTranscribing
+        ? l10n.transcribingAudio
+        : _isRecording
+        ? l10n.recordingAudio
+        : widget.placeholder ?? l10n.messageHintText;
+    final int lineCount = _composerTextLineCount(layoutText);
+    final bool isMultiline = lineCount > 1;
+    final bool showExpand = _shouldShowComposerExpandButton(lineCount);
+    final PromptCommandMatch? match = _resolvePromptCommand(
+      text,
+      selection,
+      widget.enabled,
+    );
+    final bool isContextTrigger = match?.command.startsWith('#') ?? false;
+    final bool isSkillTrigger = match?.command.startsWith('\$') ?? false;
+    final bool shouldShow = match != null;
+    final bool wasShowing = _showPromptOverlay;
+    final String previousCommand = _currentPromptCommand;
+
+    bool needsUpdate =
+        hasText != _hasText ||
+        isMultiline != _isMultiline ||
+        shouldShow != _showPromptOverlay ||
+        showExpand != _showExpandButton;
+
+    if (!needsUpdate) {
+      if (match != null) {
+        final TextRange? range = _currentPromptRange;
+        needsUpdate =
+            previousCommand != match.command ||
+            range == null ||
+            range.start != match.start ||
+            range.end != match.end;
+      } else {
+        needsUpdate =
+            _currentPromptCommand.isNotEmpty || _currentPromptRange != null;
+      }
+    }
+
+    if (!needsUpdate) return;
+
+    setState(() {
+      _hasText = hasText;
+      _isMultiline = isMultiline;
+      if (!isMultiline) {
+        _showExpandButton = false;
+      } else {
+        _showExpandButton = showExpand;
+      }
+      if (match != null) {
+        if (previousCommand != match.command) {
+          _promptSelectionIndex = 0;
+        }
+        _currentPromptCommand = match.command;
+        _currentPromptRange = TextRange(start: match.start, end: match.end);
+        _showPromptOverlay = true;
+        if (!isContextTrigger) {
+          _clearContextSuggestions();
+        }
+        if (!isSkillTrigger) {
+          _clearSkillSuggestions();
+        }
+      } else {
+        _clearContextSuggestions();
+        _clearSkillSuggestions();
+        _currentPromptCommand = '';
+        _currentPromptRange = null;
+        _promptSelectionIndex = 0;
+        _showPromptOverlay = false;
+      }
+    });
+
+    if (isContextTrigger) {
+      _scheduleContextSuggestionSearch(match!.command);
+    } else {
+      _contextSuggestionDebounce?.cancel();
+      _contextSuggestionDebounce = null;
+    }
+
+    if (isSkillTrigger) {
+      _scheduleSkillSuggestionSearch(match!.command);
+    } else {
+      _skillSuggestionDebounce?.cancel();
+      _skillSuggestionDebounce = null;
+    }
+
+    if (!wasShowing && shouldShow) {
+      // Trigger data fetch lazily when overlay first appears.
+      if (_currentPromptCommand.startsWith('/')) {
+        if (_hermesCommandsActive) {
+          ref.read(hermesSkillPromptsProvider.future);
+        } else {
+          ref.read(promptsListProvider.future);
+        }
+      } else if (_currentPromptCommand.startsWith('@')) {
+        ref.read(modelsProvider.future);
+      }
+    }
+  }
+
+  /// Whether the active model routes `/` commands to Hermes skills instead of
+  /// OpenWebUI prompts. Requires the server to advertise the skills capability
+  /// (optimistic default while capabilities load).
+  bool get _hermesCommandsActive {
+    final model = ref.read(selectedModelProvider);
+    if (model == null || !isHermesModel(model)) return false;
+    final caps = ref.read(hermesCapabilitiesProvider).asData?.value;
+    return caps?.skills ?? true;
+  }
+
+  /// The current base prompt list for the `/` overlay, from the source matching
+  /// the active model (Hermes skills or OpenWebUI prompts).
+  List<Prompt>? get _activePromptListValue => _hermesCommandsActive
+      ? ref.read(hermesSkillPromptsProvider).value
+      : ref.read(promptsListProvider).value;
+
+  bool get _openWebUiSkillsAvailable {
+    if (!ref.read(openWebUiAccountAvailableProvider)) return false;
+    final model = ref.read(selectedModelProvider);
+    return model == null ||
+        (!isHermesModel(model) && !isLocallyMintedDirectModel(model));
+  }
+
+  PromptCommandMatch? _resolvePromptCommand(
+    String text,
+    TextSelection selection,
+    bool enabled,
+  ) {
+    if (!enabled) return null;
+    if (!selection.isValid) return null;
+    final model = ref.read(selectedModelProvider);
+    // The token rules are conduit_core's (composer_commands.dart). `$` needs
+    // Open WebUI skills; `#` suggestions are Open WebUI knowledge and
+    // server-file resources, which a Hermes session cannot resolve, so the
+    // control is not offered there.
+    final match = resolveComposerCommand(
+      text,
+      selectionStart: selection.start,
+      selectionEnd: selection.end,
+      allowSkills: _openWebUiSkillsAvailable,
+      allowContext: model == null || !isHermesModel(model),
+    );
+    if (match == null) return null;
+    return PromptCommandMatch(
+      command: match.command,
+      start: match.start,
+      end: match.end,
+    );
+  }
+
+  List<Prompt> _filterPrompts(List<Prompt> prompts) {
+    if (prompts.isEmpty) return const <Prompt>[];
+    final String query = _currentPromptCommand.toLowerCase().trim();
+    // Strip leading '/' prefix so we can match prompt commands (e.g., "help")
+    final String searchQuery = query.startsWith('/')
+        ? query.substring(1)
+        : query;
+
+    final List<Prompt> filtered =
+        prompts
+            .where(
+              (prompt) =>
+                  prompt.command.toLowerCase().contains(searchQuery) &&
+                  prompt.content.isNotEmpty,
+            )
+            .toList()
+          ..sort((a, b) {
+            final int titleCompare = a.title.toLowerCase().compareTo(
+              b.title.toLowerCase(),
+            );
+            if (titleCompare != 0) return titleCompare;
+            return a.command.toLowerCase().compareTo(b.command.toLowerCase());
+          });
+
+    return filtered;
+  }
+
+  List<Model> _filterModels(List<Model> models) =>
+      filterModelsForMention(models, _currentPromptCommand);
+
+  void _clearSkillSuggestions() {
+    _skillSuggestionDebounce?.cancel();
+    _skillSuggestionDebounce = null;
+    _skillSuggestionRequestId++;
+    _skillSuggestions = const AsyncData(<WorkspaceSkillSummary>[]);
+  }
+
+  void _scheduleSkillSuggestionSearch(String command) {
+    _skillSuggestionDebounce?.cancel();
+    final requestId = ++_skillSuggestionRequestId;
+    setState(() {
+      _skillSuggestions = const AsyncLoading();
+      _promptSelectionIndex = 0;
+    });
+
+    final query = command.length > 1 ? command.substring(1).trim() : '';
+    _skillSuggestionDebounce = Timer(_contextSuggestionDelay, () {
+      unawaited(_loadSkillSuggestions(command, query, requestId));
+    });
+  }
+
+  Future<void> _loadSkillSuggestions(
+    String command,
+    String query,
+    int requestId,
+  ) async {
+    final api = ref.read(apiServiceProvider);
+    final token = ref.read(authTokenProvider3);
+    if (api == null || !_openWebUiSkillsAvailable) {
+      if (mounted && !_isDeactivated) _hidePromptOverlay();
+      return;
+    }
+
+    try {
+      final skills = await searchComposerSkills(api, query: query);
+      if (!_skillSuggestionRequestIsCurrent(command, requestId, api, token)) {
+        return;
+      }
+      setState(() {
+        _skillSuggestions = AsyncData(skills);
+        _promptSelectionIndex = skills.isEmpty
+            ? 0
+            : _promptSelectionIndex.clamp(0, skills.length - 1);
+      });
+    } catch (error, stackTrace) {
+      if (!_skillSuggestionRequestIsCurrent(command, requestId, api, token)) {
+        return;
+      }
+      DebugLogger.warning(
+        'skill suggestion search failed',
+        scope: 'chat/skills',
+        data: {'errorType': error.runtimeType.toString()},
+      );
+      setState(() {
+        _skillSuggestions = AsyncError(error, stackTrace);
+        _promptSelectionIndex = 0;
+      });
+    }
+  }
+
+  bool _skillSuggestionRequestIsCurrent(
+    String command,
+    int requestId,
+    Object api,
+    String? token,
+  ) {
+    return mounted &&
+        !_isDeactivated &&
+        requestId == _skillSuggestionRequestId &&
+        _currentPromptCommand == command &&
+        _currentPromptCommand.startsWith('\$') &&
+        identical(ref.read(apiServiceProvider), api) &&
+        ref.read(authTokenProvider3) == token &&
+        _openWebUiSkillsAvailable;
+  }
+
+  void _clearContextSuggestions() {
+    _contextSuggestionDebounce?.cancel();
+    _contextSuggestionDebounce = null;
+    _contextSuggestionRequestId++;
+    _isContextSuggestionLoading = false;
+    _contextSuggestions = const <_ComposerContextSuggestion>[];
+  }
+
+  void _scheduleContextSuggestionSearch(String command) {
+    _contextSuggestionDebounce?.cancel();
+    _contextSuggestionDebounce = null;
+
+    final int requestId = ++_contextSuggestionRequestId;
+
+    setState(() {
+      _isContextSuggestionLoading = true;
+      _contextSuggestions = const <_ComposerContextSuggestion>[];
+      _promptSelectionIndex = 0;
+    });
+
+    final String query = command.length > 1 ? command.substring(1).trim() : '';
+    _contextSuggestionDebounce = Timer(_contextSuggestionDelay, () {
+      unawaited(_loadContextSuggestions(command, query, requestId));
+    });
+  }
+
+  Future<void> _loadContextSuggestions(
+    String command,
+    String query,
+    int requestId,
+  ) async {
+    final api = ref.read(apiServiceProvider);
+    final token = ref.read(authTokenProvider3);
+    if (api == null) {
+      if (!mounted || _isDeactivated) return;
+      if (requestId != _contextSuggestionRequestId) return;
+      setState(() {
+        _isContextSuggestionLoading = false;
+        _contextSuggestions = const <_ComposerContextSuggestion>[];
+        _promptSelectionIndex = 0;
+      });
+      return;
+    }
+
+    final l10n = AppLocalizations.of(context)!;
+    final isIOS = Theme.of(context).platform == TargetPlatform.iOS;
+    // The searches and the rows they become are conduit_core's
+    // (composer_commands.dart); this adds the icons.
+    final search = await searchComposerContext(
+      api,
+      query: query,
+      includeNotes: ref.read(notesFeatureEnabledProvider),
+      // As soon as the notes search is refused, not after the slower ones.
+      onNotesForbidden: () {
+        if (mounted &&
+            !_isDeactivated &&
+            identical(ref.read(apiServiceProvider), api) &&
+            ref.read(authTokenProvider3) == token) {
+          ref.read(notesFeatureEnabledProvider.notifier).setEnabled(false);
+        }
+      },
+    );
+
+    if (!mounted || _isDeactivated) return;
+    if (requestId != _contextSuggestionRequestId) return;
+    if (!_currentPromptCommand.startsWith('#')) return;
+    if (_currentPromptCommand != command) return;
+
+    final List<_ComposerContextSuggestion> suggestions = [
+      for (final suggestion in buildComposerContextSuggestions(
+        notes: search.notes,
+        bases: search.bases,
+        files: search.files,
+        untitledLabel: l10n.untitled,
+        knowledgeBaseLabel: l10n.knowledgeBase,
+        fileLabel: l10n.file,
+        perType: _maxContextSuggestionsPerType,
+      ))
+        _ComposerContextSuggestion(
+          type: suggestion.type,
+          id: suggestion.id,
+          displayName: suggestion.displayName,
+          subtitle: suggestion.subtitle,
+          collectionName: suggestion.collectionName,
+          source: suggestion.source,
+          icon: switch (suggestion.type) {
+            _ComposerContextSuggestionType.note =>
+              isIOS ? CupertinoIcons.doc_text : Icons.sticky_note_2_outlined,
+            _ComposerContextSuggestionType.knowledgeBase =>
+              isIOS ? CupertinoIcons.folder : Icons.folder_outlined,
+            _ComposerContextSuggestionType.knowledgeFile =>
+              isIOS ? CupertinoIcons.doc : Icons.description_outlined,
+          },
+        ),
+    ];
+
+    setState(() {
+      _isContextSuggestionLoading = false;
+      _contextSuggestions = suggestions;
+      if (suggestions.isEmpty) {
+        _promptSelectionIndex = 0;
+      } else if (_promptSelectionIndex >= suggestions.length) {
+        _promptSelectionIndex = suggestions.length - 1;
+      }
+    });
+  }
+
+  void _applyContextSuggestion(_ComposerContextSuggestion suggestion) {
+    final TextRange? range = _currentPromptRange;
+    if (range == null) return;
+
+    ConduitHaptics.selectionClick();
+
+    final result = removeComposerCommandToken(
+      _controller.text,
+      range.start,
+      range.end,
+    );
+    _controller.value = TextEditingValue(
+      text: result.text,
+      selection: TextSelection.collapsed(offset: result.caret),
+      composing: TextRange.empty,
+    );
+
+    switch (suggestion.type) {
+      case _ComposerContextSuggestionType.note:
+        ref
+            .read(contextAttachmentsProvider.notifier)
+            .addNote(
+              noteId: suggestion.id,
+              displayName: suggestion.displayName,
+            );
+        break;
+      case _ComposerContextSuggestionType.knowledgeBase:
+        _hidePromptOverlay();
+        unawaited(_openKnowledgePicker(initialBaseId: suggestion.id));
+        return;
+      case _ComposerContextSuggestionType.knowledgeFile:
+        ref
+            .read(contextAttachmentsProvider.notifier)
+            .addKnowledge(
+              displayName: suggestion.displayName,
+              fileId: suggestion.id,
+              collectionName: suggestion.collectionName,
+              url: suggestion.source,
+            );
+        break;
+    }
+
+    _hidePromptOverlay();
+    _ensureFocusedIfEnabled();
+  }
+
+  void _applyModel(Model model) {
+    final TextRange? range = _currentPromptRange;
+    if (range == null) return;
+
+    // Replace the @query with @ModelName (keep it visible like OpenWebUI).
+    final inserted = insertComposerMention(
+      _controller.text,
+      ComposerCommandMatch(
+        command: _currentPromptCommand,
+        start: range.start,
+        end: range.end,
+      ),
+      prefix: '@',
+      label: model.name,
+    );
+    final String newText = inserted.text;
+
+    _controller.value = TextEditingValue(
+      text: newText,
+      selection: TextSelection.collapsed(offset: inserted.caret),
+    );
+
+    // Track the mention range for styled rendering
+    // (exclude trailing space) and store the model ID
+    // so we can convert to OpenWebUI wire format on send.
+    _controller.addMention(
+      inserted.mentionStart,
+      inserted.mentionEnd,
+      idType: 'M',
+      id: model.id,
+      label: model.name,
+    );
+
+    // Switch to the selected model.
+    ref.read(selectedModelProvider.notifier).set(model);
+
+    setState(() {
+      _hasText = newText.trim().isNotEmpty;
+      _showPromptOverlay = false;
+      _currentPromptCommand = '';
+      _currentPromptRange = null;
+      _promptSelectionIndex = 0;
+    });
+  }
+
+  void _applySkill(WorkspaceSkillSummary skill) {
+    final range = _currentPromptRange;
+    if (range == null) return;
+
+    final inserted = insertComposerMention(
+      _controller.text,
+      ComposerCommandMatch(
+        command: _currentPromptCommand,
+        start: range.start,
+        end: range.end,
+      ),
+      prefix: '\$',
+      label: skill.name,
+    );
+    final newText = inserted.text;
+
+    _controller.value = TextEditingValue(
+      text: newText,
+      selection: TextSelection.collapsed(offset: inserted.caret),
+    );
+    _controller.addMention(
+      inserted.mentionStart,
+      inserted.mentionEnd,
+      id: skill.id,
+      label: skill.name,
+      kind: ComposerMentionKind.skill,
+    );
+
+    setState(() {
+      _hasText = newText.trim().isNotEmpty;
+      _clearSkillSuggestions();
+      _showPromptOverlay = false;
+      _currentPromptCommand = '';
+      _currentPromptRange = null;
+      _promptSelectionIndex = 0;
+    });
+    _ensureFocusedIfEnabled();
+  }
+
+  void _movePromptSelection(int delta) {
+    if (_currentPromptCommand.startsWith('#')) {
+      final int itemCount = _contextSuggestions.length;
+      if (itemCount == 0) return;
+
+      int newIndex = _promptSelectionIndex + delta;
+      if (newIndex < 0) {
+        newIndex = 0;
+      } else if (newIndex >= itemCount) {
+        newIndex = itemCount - 1;
+      }
+      if (newIndex == _promptSelectionIndex) return;
+
+      setState(() {
+        _promptSelectionIndex = newIndex;
+      });
+      return;
+    }
+
+    // Determine filtered list length based on trigger type.
+    final int filteredLength;
+    if (_currentPromptCommand.startsWith('\$')) {
+      filteredLength = _skillSuggestions.asData?.value.length ?? 0;
+    } else if (_currentPromptCommand.startsWith('@')) {
+      final List<Model>? models = ref.read(modelsProvider).value;
+      if (models == null || models.isEmpty) return;
+      filteredLength = _filterModels(models).length;
+    } else {
+      final List<Prompt>? prompts = _activePromptListValue;
+      if (prompts == null || prompts.isEmpty) return;
+      filteredLength = _filterPrompts(prompts).length;
+    }
+    if (filteredLength == 0) return;
+
+    int newIndex = _promptSelectionIndex + delta;
+    if (newIndex < 0) {
+      newIndex = 0;
+    } else if (newIndex >= filteredLength) {
+      newIndex = filteredLength - 1;
+    }
+    if (newIndex == _promptSelectionIndex) return;
+
+    setState(() {
+      _promptSelectionIndex = newIndex;
+    });
+  }
+
+  void _confirmPromptSelection() {
+    if (_currentPromptCommand.startsWith('#')) {
+      if (_contextSuggestions.isEmpty) {
+        _openKnowledgePicker();
+        return;
+      }
+
+      final int index = _promptSelectionIndex.clamp(
+        0,
+        _contextSuggestions.length - 1,
+      );
+      _applyContextSuggestion(_contextSuggestions[index]);
+      return;
+    }
+
+    if (_currentPromptCommand.startsWith('@')) {
+      final List<Model>? models = ref.read(modelsProvider).value;
+      if (models == null || models.isEmpty) return;
+      final List<Model> filtered = _filterModels(models);
+      if (filtered.isEmpty) return;
+      int index = _promptSelectionIndex.clamp(0, filtered.length - 1);
+      _applyModel(filtered[index]);
+      return;
+    }
+
+    if (_currentPromptCommand.startsWith('\$')) {
+      final skills =
+          _skillSuggestions.asData?.value ?? const <WorkspaceSkillSummary>[];
+      if (skills.isEmpty) return;
+      final index = _promptSelectionIndex.clamp(0, skills.length - 1);
+      _applySkill(skills[index]);
+      return;
+    }
+
+    final List<Prompt>? prompts = _activePromptListValue;
+    if (prompts == null || prompts.isEmpty) return;
+
+    final List<Prompt> filtered = _filterPrompts(prompts);
+    if (filtered.isEmpty) return;
+
+    int index = _promptSelectionIndex;
+    if (index < 0) {
+      index = 0;
+    } else if (index >= filtered.length) {
+      index = filtered.length - 1;
+    }
+    _applyPrompt(filtered[index]);
+  }
+
+  void _applyPrompt(Prompt prompt) {
+    final TextRange? range = _currentPromptRange;
+    if (range == null) return;
+
+    // Check if the prompt has variables that need processing
+    const parser = PromptVariableParser();
+    if (parser.hasVariables(prompt.content)) {
+      _processPromptWithVariables(prompt, range);
+    } else {
+      _insertPromptContent(prompt.content, range);
+    }
+  }
+
+  Future<void> _processPromptWithVariables(
+    Prompt prompt,
+    TextRange range,
+  ) async {
+    // Hide overlay first
+    setState(() {
+      _showPromptOverlay = false;
+      _currentPromptCommand = '';
+      _currentPromptRange = null;
+      _promptSelectionIndex = 0;
+    });
+
+    // Get user info for system variables
+    final authUser = ref.read(currentUserProvider2);
+    final userAsync = ref.read(currentUserProvider);
+    final user = userAsync.maybeWhen(
+      data: (value) => value ?? authUser,
+      orElse: () => authUser,
+    );
+    final locale = Localizations.localeOf(context);
+    String? userLocation;
+    const parser = PromptVariableParser();
+    final needsUserLocation = parser
+        .parse(prompt.content)
+        .any(
+          (variable) =>
+              variable.isSystemVariable &&
+              variable.name.toUpperCase() == 'USER_LOCATION',
+        );
+
+    if (needsUserLocation) {
+      final locationResult = await ref
+          .read(locationServiceProvider)
+          .resolveCurrentLocation();
+      userLocation = locationResult.hasLocation
+          ? locationResult.location
+          : 'LOCATION_UNKNOWN';
+    }
+
+    // Create the processor with system variable context
+    final systemResolver = SystemVariableResolver(
+      userName: user?.name ?? user?.email,
+      userLanguage: locale.languageCode,
+      userLocation: userLocation,
+      clipboard: ref.read(clipboardPortProvider),
+    );
+    final processor = PromptProcessor(
+      parser: parser,
+      systemResolver: systemResolver,
+    );
+
+    // Process system variables first
+    final processed = await processor.process(prompt.content);
+    if (!mounted) return;
+
+    String finalContent = processed.content;
+
+    // If there are user input variables, show the dialog
+    if (processed.needsUserInput) {
+      final values = await PromptVariableDialog.show(
+        context,
+        variables: processed.userInputVariables,
+        promptTitle: prompt.title,
+      );
+
+      if (values == null || !mounted) {
+        // User cancelled - restore focus
+        _ensureFocusedIfEnabled();
+        return;
+      }
+
+      // Apply user-provided values
+      finalContent = processor.applyUserValues(finalContent, values);
+    }
+
+    // Insert the fully processed content
+    _insertPromptContent(finalContent, range);
+  }
+
+  void _insertPromptContent(String content, TextRange range) {
+    final String text = _controller.text;
+    final String before = text.substring(0, range.start);
+    final String after = text.substring(range.end);
+    final int caret = before.length + content.length;
+
+    _controller.value = TextEditingValue(
+      text: '$before$content$after',
+      selection: TextSelection.collapsed(offset: caret),
+      composing: TextRange.empty,
+    );
+
+    _ensureFocusedIfEnabled();
+
+    setState(() {
+      _showPromptOverlay = false;
+      _currentPromptCommand = '';
+      _currentPromptRange = null;
+      _promptSelectionIndex = 0;
+    });
+  }
+
+  void _hidePromptOverlay() {
+    if (!_showPromptOverlay) return;
+    setState(() {
+      _clearContextSuggestions();
+      _clearSkillSuggestions();
+      _showPromptOverlay = false;
+      _currentPromptCommand = '';
+      _currentPromptRange = null;
+      _promptSelectionIndex = 0;
+    });
+  }
+
+  bool get _shouldShowPromptOverlay {
+    if (!_showPromptOverlay) return false;
+    if (_currentPromptCommand.startsWith('\$')) {
+      return _openWebUiSkillsAvailable;
+    }
+    final model = ref.read(selectedModelProvider);
+    return !(model != null &&
+        isHermesModel(model) &&
+        _currentPromptCommand.startsWith('#'));
+  }
+
+  bool get _canConfirmPromptSelection {
+    if (!_shouldShowPromptOverlay) return false;
+    if (!_currentPromptCommand.startsWith('\$')) return true;
+    return _skillSuggestions.asData?.value.isNotEmpty ?? false;
+  }
+
+  Future<void> _openKnowledgePicker({String? initialBaseId}) async {
+    _hidePromptOverlay();
+
+    // Ensure bases are loaded in the centralized cache
+    final cacheNotifier = ref.read(knowledgeCacheProvider.notifier);
+    await cacheNotifier.ensureBases();
+    if (!mounted) return;
+
+    // Track selected base ID outside the builder so it persists across rebuilds
+    String? selectedBaseId = initialBaseId;
+
+    if (selectedBaseId != null) {
+      final cacheState = ref.read(knowledgeCacheProvider);
+      final hasBase = cacheState.bases.any((base) => base.id == selectedBaseId);
+      if (hasBase) {
+        await cacheNotifier.fetchFilesForBase(selectedBaseId);
+        if (!mounted) return;
+      } else {
+        selectedBaseId = null;
+      }
+    }
+
+    if (Platform.isIOS) {
+      try {
+        final l10n = AppLocalizations.of(context)!;
+        final cacheState = ref.read(knowledgeCacheProvider);
+        final bases = cacheState.bases;
+        if (bases.isEmpty) {
+          return;
+        }
+        final selectedBase = await NativeSheetBridge.instance
+            .presentOptionsSelector(
+              title: l10n.knowledgeBase,
+              selectedOptionId: selectedBaseId,
+              options: [
+                for (final base in bases)
+                  NativeSheetOptionConfig(
+                    id: base.id,
+                    label: base.name,
+                    subtitle: base.description,
+                    sfSymbol: 'books.vertical',
+                  ),
+              ],
+              rethrowErrors: true,
+            );
+        if (selectedBase == null) {
+          return;
+        }
+        await cacheNotifier.fetchFilesForBase(selectedBase);
+        if (!mounted) {
+          return;
+        }
+        final selectedBaseModel = bases.firstWhere(
+          (base) => base.id == selectedBase,
+        );
+        final files =
+            ref.read(knowledgeCacheProvider).files[selectedBase] ??
+            const <KnowledgeBaseFile>[];
+        if (files.isEmpty) {
+          return;
+        }
+        final selectedFileId = await NativeSheetBridge.instance
+            .presentOptionsSelector(
+              title: selectedBaseModel.name,
+              subtitle: l10n.files,
+              options: [
+                for (final file in files)
+                  NativeSheetOptionConfig(
+                    id: file.id,
+                    label: file.meta?['name']?.toString() ?? file.filename,
+                    subtitle: file.meta?['source']?.toString() ?? file.filename,
+                    sfSymbol: 'doc.text',
+                  ),
+              ],
+              rethrowErrors: true,
+            );
+        if (selectedFileId == null || !mounted) {
+          return;
+        }
+        for (final file in files) {
+          if (file.id == selectedFileId) {
+            ref
+                .read(contextAttachmentsProvider.notifier)
+                .addKnowledge(
+                  displayName: file.meta?['name']?.toString() ?? file.filename,
+                  fileId: file.id,
+                  collectionName: selectedBaseModel.name,
+                  url: file.meta?['source']?.toString(),
+                );
+            break;
+          }
+        }
+        return;
+      } catch (_) {
+        if (!mounted) {
+          return;
+        }
+      }
+    }
+
+    await ThemedSheets.showCustom<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (modalContext) {
+        return ModalSheetSafeArea(
+          // Use StatefulBuilder to manage selectedBaseId locally so that
+          // selecting a knowledge base triggers a proper rebuild.
+          child: StatefulBuilder(
+            builder: (statefulContext, setModalState) {
+              return Consumer(
+                builder: (innerContext, innerRef, _) {
+                  final cacheState = innerRef.watch(knowledgeCacheProvider);
+                  final bases = cacheState.bases;
+                  final filesMap = cacheState.files;
+                  final files = selectedBaseId != null
+                      ? filesMap[selectedBaseId] ?? const <KnowledgeBaseFile>[]
+                      : const <KnowledgeBaseFile>[];
+                  final loading =
+                      cacheState.isLoading ||
+                      (selectedBaseId != null &&
+                          !filesMap.containsKey(selectedBaseId));
+
+                  Future<void> loadFiles(KnowledgeBase base) async {
+                    setModalState(() {
+                      selectedBaseId = base.id;
+                    });
+                    await innerRef
+                        .read(knowledgeCacheProvider.notifier)
+                        .fetchFilesForBase(base.id);
+                  }
+
+                  return Container(
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: innerContext.conduitTheme.surfaceBackground,
+                      borderRadius: const BorderRadius.vertical(
+                        top: Radius.circular(AppBorderRadius.modal),
+                      ),
+                      boxShadow: ConduitShadows.modal(innerContext),
+                    ),
+                    child: Material(
+                      color: Colors.transparent,
+                      borderRadius: const BorderRadius.vertical(
+                        top: Radius.circular(AppBorderRadius.modal),
+                      ),
+                      clipBehavior: Clip.antiAlias,
+                      child: SizedBox(
+                        height: MediaQuery.of(innerContext).size.height * 0.6,
+                        child: Row(
+                          children: [
+                            Expanded(
+                              flex: 1,
+                              child: ListView.builder(
+                                itemCount: bases.length,
+                                itemBuilder: (context, index) {
+                                  final base = bases[index];
+                                  final isSelected = selectedBaseId == base.id;
+                                  return AdaptiveListTile(
+                                    selected: isSelected,
+                                    title: Text(base.name),
+                                    onTap: () => loadFiles(base),
+                                  );
+                                },
+                              ),
+                            ),
+                            const VerticalDivider(width: 1),
+                            Expanded(
+                              flex: 2,
+                              child: loading
+                                  ? const Center(
+                                      child: AdaptiveProgressIndicator(),
+                                    )
+                                  : ListView.builder(
+                                      itemCount: files.length,
+                                      itemBuilder: (context, index) {
+                                        final file = files[index];
+                                        final KnowledgeBase? selectedBase =
+                                            bases.isEmpty
+                                            ? null
+                                            : bases.firstWhere(
+                                                (b) => b.id == selectedBaseId,
+                                                orElse: () => bases.first,
+                                              );
+                                        return AdaptiveListTile(
+                                          title: Text(
+                                            file.meta?['name']?.toString() ??
+                                                file.filename,
+                                            overflow: TextOverflow.ellipsis,
+                                          ),
+                                          subtitle: Text(
+                                            file.meta?['source']?.toString() ??
+                                                file.filename,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                          ),
+                                          onTap: () {
+                                            innerRef
+                                                .read(
+                                                  contextAttachmentsProvider
+                                                      .notifier,
+                                                )
+                                                .addKnowledge(
+                                                  displayName:
+                                                      file.meta?['name']
+                                                          ?.toString() ??
+                                                      file.filename,
+                                                  fileId: file.id,
+                                                  collectionName:
+                                                      selectedBase?.name ??
+                                                      'Unknown',
+                                                  url: file.meta?['source']
+                                                      ?.toString(),
+                                                );
+                                            if (modalContext.mounted) {
+                                              Navigator.of(modalContext).pop();
+                                            }
+                                          },
+                                        );
+                                      },
+                                    ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+
+  /// Returns the correct overlay widget for the current trigger character.
+  Widget _buildActiveOverlay() {
+    final overlayColor = context.conduitTheme.cardBackground;
+    final borderColor = context.conduitTheme.cardBorder.withValues(
+      alpha: Theme.of(context).brightness == Brightness.dark ? 0.6 : 0.4,
+    );
+    final selectedModel = ref.watch(selectedModelProvider);
+    final hermesCapabilities = ref
+        .watch(hermesCapabilitiesProvider)
+        .asData
+        ?.value;
+    final useHermesSkills =
+        selectedModel != null &&
+        isHermesModel(selectedModel) &&
+        (hermesCapabilities?.skills ?? true);
+
+    if (_currentPromptCommand.startsWith('#')) {
+      return _buildContextSuggestionOverlay(context, overlayColor, borderColor);
+    }
+    if (_currentPromptCommand.startsWith('@')) {
+      return ModelSuggestionOverlay(
+        filteredModels: _filterModels,
+        selectionIndex: _promptSelectionIndex,
+        onModelSelected: _applyModel,
+      );
+    }
+    if (_currentPromptCommand.startsWith('\$')) {
+      return SkillSuggestionOverlay(
+        skills: _skillSuggestions,
+        selectionIndex: _promptSelectionIndex,
+        onSkillSelected: _applySkill,
+      );
+    }
+    return PromptSuggestionOverlay(
+      useHermesSkills: useHermesSkills,
+      filteredPrompts: _filterPrompts,
+      selectionIndex: _promptSelectionIndex,
+      onPromptSelected: _applyPrompt,
+    );
+  }
+
+  Widget _buildContextSuggestionOverlay(
+    BuildContext context,
+    Color overlayColor,
+    Color borderColor,
+  ) {
+    if (_isContextSuggestionLoading) {
+      return _buildSuggestionOverlayContainer(
+        context,
+        overlayColor: overlayColor,
+        borderColor: borderColor,
+        child: _ContextSuggestionPlaceholder(
+          leading: SizedBox(
+            width: IconSize.large,
+            height: IconSize.large,
+            child: AdaptiveProgressIndicator(
+              strokeWidth: BorderWidth.regular,
+              color: context.conduitTheme.loadingIndicator,
+            ),
+          ),
+        ),
+      );
+    }
+
+    if (_contextSuggestions.isEmpty) {
+      return _buildKnowledgeOverlay(context, overlayColor, borderColor);
+    }
+
+    final l10n = AppLocalizations.of(context)!;
+    final int activeIndex = _promptSelectionIndex.clamp(
+      0,
+      _contextSuggestions.length - 1,
+    );
+
+    return _buildSuggestionOverlayContainer(
+      context,
+      overlayColor: overlayColor,
+      borderColor: borderColor,
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxHeight: 280),
+        child: ListView.builder(
+          padding: const EdgeInsets.symmetric(vertical: Spacing.xs),
+          shrinkWrap: true,
+          physics: const ClampingScrollPhysics(),
+          itemCount: _contextSuggestions.length,
+          itemBuilder: (context, index) {
+            final suggestion = _contextSuggestions[index];
+            final previousType = index == 0
+                ? null
+                : _contextSuggestions[index - 1].type;
+            final bool showSectionHeader = previousType != suggestion.type;
+            final bool isSelected = index == activeIndex;
+            final highlight = isSelected
+                ? context.conduitTheme.navigationSelectedBackground.withValues(
+                    alpha: 0.4,
+                  )
+                : Colors.transparent;
+
+            String sectionTitle(_ComposerContextSuggestionType type) {
+              return switch (type) {
+                _ComposerContextSuggestionType.note => l10n.notes,
+                _ComposerContextSuggestionType.knowledgeBase =>
+                  l10n.knowledgeBase,
+                _ComposerContextSuggestionType.knowledgeFile => l10n.file,
+              };
+            }
+
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (showSectionHeader)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(
+                      Spacing.sm,
+                      Spacing.xs,
+                      Spacing.sm,
+                      Spacing.xs,
+                    ),
+                    child: Text(
+                      sectionTitle(suggestion.type),
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: context.conduitTheme.textSecondary,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                Semantics(
+                  button: true,
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () {
+                      _applyContextSuggestion(suggestion);
+                    },
+                    child: Container(
+                      decoration: BoxDecoration(
+                        color: highlight,
+                        borderRadius: BorderRadius.circular(
+                          AppBorderRadius.card,
+                        ),
+                      ),
+                      margin: const EdgeInsets.symmetric(
+                        horizontal: Spacing.xs,
+                        vertical: Spacing.xxs,
+                      ),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: Spacing.sm,
+                        vertical: Spacing.xs,
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
+                            suggestion.icon,
+                            size: IconSize.medium,
+                            color: context.conduitTheme.textSecondary,
+                          ),
+                          const SizedBox(width: Spacing.sm),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  suggestion.displayName,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: Theme.of(context).textTheme.bodyMedium
+                                      ?.copyWith(
+                                        color: context.conduitTheme.textPrimary,
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                ),
+                                if (suggestion.subtitle != null &&
+                                    suggestion.subtitle!.isNotEmpty)
+                                  Padding(
+                                    padding: const EdgeInsets.only(
+                                      top: Spacing.xxs,
+                                    ),
+                                    child: Text(
+                                      suggestion.subtitle!,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .bodySmall
+                                          ?.copyWith(
+                                            color: context
+                                                .conduitTheme
+                                                .textSecondary,
+                                          ),
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSuggestionOverlayContainer(
+    BuildContext context, {
+    required Color overlayColor,
+    required Color borderColor,
+    required Widget child,
+  }) {
+    return Container(
+      decoration: BoxDecoration(
+        color: overlayColor,
+        borderRadius: BorderRadius.circular(AppBorderRadius.card),
+        border: Border.all(color: borderColor, width: BorderWidth.thin),
+        boxShadow: [
+          BoxShadow(
+            color: context.conduitTheme.cardShadow.withValues(
+              alpha: Theme.of(context).brightness == Brightness.dark
+                  ? 0.28
+                  : 0.16,
+            ),
+            blurRadius: 22,
+            offset: const Offset(0, 8),
+            spreadRadius: -4,
+          ),
+        ],
+      ),
+      child: Material(
+        color: Colors.transparent,
+        borderRadius: BorderRadius.circular(AppBorderRadius.card),
+        clipBehavior: Clip.antiAlias,
+        child: child,
+      ),
+    );
+  }
+
+  Widget _buildKnowledgeOverlay(
+    BuildContext context,
+    Color overlayColor,
+    Color borderColor,
+  ) {
+    final l10n = AppLocalizations.of(context)!;
+    return _buildSuggestionOverlayContainer(
+      context,
+      overlayColor: overlayColor,
+      borderColor: borderColor,
+      child: AdaptiveListTile(
+        title: Text(l10n.browseKnowledgeBase),
+        subtitle: Text(l10n.knowledgePickerHint),
+        leading: const Icon(Icons.folder_outlined),
+        onTap: () => _openKnowledgePicker(),
+      ),
+    );
+  }
+
+  bool get _selectedModelAcceptsImageInput {
+    final model = ref.read(selectedModelProvider);
+    if (model == null) return false;
+    if (isHermesModel(model)) {
+      // Hermes image input is opt-in. Older servers and capabilities still in
+      // flight must remain text-only rather than accepting an attachment the
+      // transport cannot faithfully deliver.
+      return ref.read(hermesCapabilitiesProvider).asData?.value.inputImages ==
+          true;
+    }
+    return ref.read(visionCapableModelsProvider).contains(model.id);
+  }
+
+  ComposerOverflowAttachmentAvailability get _overflowAttachmentAvailability {
+    final model = ref.read(selectedModelProvider);
+    final hermesMode = model != null && isHermesModel(model);
+    if (hermesMode) {
+      final inputImages =
+          ref.read(hermesCapabilitiesProvider).asData?.value.inputImages ==
+          true;
+      return ComposerOverflowAttachmentAvailability(
+        // Hermes documents are ingested locally and sent as text, so this is
+        // deliberately independent of the remote image-input capability.
+        file: widget.onFileAttachment != null,
+        serverFile: false,
+        photo: inputImages && widget.onImageAttachment != null,
+        camera: inputImages && widget.onCameraCapture != null,
+        web: false,
+      );
+    }
+
+    final directMode = model != null && hasReservedDirectIdentity(model);
+    final imageInputAvailable =
+        model != null &&
+        ref.read(visionCapableModelsProvider).contains(model.id);
+    final fileInputAvailable =
+        model != null &&
+        ref.read(fileUploadCapableModelsProvider).contains(model.id);
+    final mcpContentAvailable =
+        directMode &&
+        ref
+            .read(directMcpServersProvider)
+            .maybeWhen(
+              data: (servers) => servers.any((server) => server.enabled),
+              orElse: () => false,
+            );
+    return ComposerOverflowAttachmentAvailability(
+      file: fileInputAvailable && widget.onFileAttachment != null,
+      serverFile:
+          !directMode &&
+          fileInputAvailable &&
+          widget.onServerFileAttachment != null,
+      photo: imageInputAvailable && widget.onImageAttachment != null,
+      camera: imageInputAvailable && widget.onCameraCapture != null,
+      web: !directMode && widget.onWebAttachment != null,
+      mcpContent: mcpContentAvailable,
+    );
+  }
+
+  List<IosKeyboardAttachmentActionConfig> _nativeKeyboardAttachmentActions({
+    required AppLocalizations l10n,
+    required bool webSearchAvailable,
+    required bool webSearchEnabled,
+    required bool imageGenerationAvailable,
+    required bool imageGenerationEnabled,
+    required List<Tool> availableTools,
+    required List<String> selectedToolIds,
+    required List<ToggleFilter> availableFilters,
+    required List<String> selectedFilterIds,
+    required ComposerPersonalConnections connections,
+    required bool toolSettingsAvailable,
+    required bool compareModelsAvailable,
+    required bool hasMessage,
+    required CodeInterpreterOffer? codeInterpreter,
+  }) {
+    if (kIsWeb || !Platform.isIOS) {
+      return const <IosKeyboardAttachmentActionConfig>[];
+    }
+
+    final selectedModel = ref.read(selectedModelProvider);
+    final hermesMode = selectedModel != null && isHermesModel(selectedModel);
+
+    final directMode =
+        selectedModel != null && hasReservedDirectIdentity(selectedModel);
+
+    return buildIosKeyboardAttachmentActions(
+      l10n: l10n,
+      attachmentAvailability: _overflowAttachmentAvailability,
+      hermesMode: hermesMode,
+      directMode: directMode,
+      webSearchAvailable: webSearchAvailable,
+      webSearchEnabled: webSearchEnabled,
+      imageGenerationAvailable: imageGenerationAvailable,
+      imageGenerationEnabled: imageGenerationEnabled,
+      availableTools: availableTools,
+      selectedToolIds: selectedToolIds,
+      availableFilters: availableFilters,
+      selectedFilterIds: selectedFilterIds,
+      connections: connections,
+      toolSettingsAvailable: toolSettingsAvailable,
+      compareModelsAvailable: compareModelsAvailable,
+      hasMessage: hasMessage,
+      codeInterpreter: codeInterpreter,
+    );
+  }
+
+  /// Personal connections for the native panel; none for the model families
+  /// that have no Open WebUI account behind them.
+  ComposerPersonalConnections _currentNativeConnections() {
+    final selectedModel = ref.read(selectedModelProvider);
+    if (selectedModel != null &&
+        (isHermesModel(selectedModel) ||
+            hasReservedDirectIdentity(selectedModel))) {
+      return ComposerPersonalConnections.none;
+    }
+    return readComposerPersonalConnections(ref.read);
+  }
+
+  List<IosKeyboardAttachmentActionConfig>
+  _currentNativeKeyboardAttachmentActions({
+    required AppLocalizations l10n,
+    required ComposerPersonalConnections connections,
+  }) {
+    final selectedModel = ref.read(selectedModelProvider);
+    final directMode =
+        selectedModel != null && hasReservedDirectIdentity(selectedModel);
+    final directToolsAvailable =
+        directMode &&
+        directBindingSupportsLocalMcp(
+          ref.read(directModelRegistryProvider).resolve(selectedModel),
+        );
+    final tools = directMode
+        ? (directToolsAvailable
+              ? ref.read(directMcpToolsProvider)
+              : const AsyncData<List<Tool>>([]))
+        : ref.read(toolsListProvider);
+    final availableTools = tools.maybeWhen<List<Tool>>(
+      data: (tools) => tools,
+      orElse: () => const <Tool>[],
+    );
+
+    return _nativeKeyboardAttachmentActions(
+      l10n: l10n,
+      webSearchAvailable: ref.read(webSearchAvailableProvider),
+      webSearchEnabled: ref.read(webSearchEnabledProvider),
+      imageGenerationAvailable: ref.read(imageGenerationAvailableProvider),
+      imageGenerationEnabled: ref.read(imageGenerationEnabledProvider),
+      availableTools: availableTools,
+      selectedToolIds: ref.read(selectedToolIdsProvider),
+      availableFilters:
+          ref.read(selectedModelProvider)?.filters ?? const <ToggleFilter>[],
+      selectedFilterIds: ref.read(selectedFilterIdsProvider),
+      connections: connections,
+      toolSettingsAvailable: ref.read(personalValvesCommandAvailableProvider),
+      compareModelsAvailable: _comparisonCommandAvailable(ref.read),
+      hasMessage: _controller.text.trim().isNotEmpty,
+      codeInterpreter: ref.read(codeInterpreterOfferProvider),
+    );
+  }
+
+  void _scheduleNativeKeyboardAttachmentSync() {
+    if (kIsWeb || !Platform.isIOS || !_isNativeAttachmentPanelVisible) {
+      return;
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _isDeactivated || !_isNativeAttachmentPanelVisible) {
+        return;
+      }
+
+      final l10n = AppLocalizations.of(context);
+      if (l10n == null) {
+        return;
+      }
+
+      final connections = _currentNativeConnections();
+      final actions = _currentNativeKeyboardAttachmentActions(
+        l10n: l10n,
+        connections: connections,
+      );
+      if (actions.isEmpty) {
+        // An empty configuration is intentionally ignored by the bridge. Hide
+        // an already-open panel when the newly selected model (for example,
+        // Hermes) supports no native attachment actions.
+        _nativeConnectionsOwner = null;
+        unawaited(IosKeyboardAttachmentBridge.instance.hide());
+        return;
+      }
+
+      _nativeConnectionsOwner = connections.owner;
+      unawaited(
+        IosKeyboardAttachmentBridge.instance.configure(actions: actions),
+      );
+    });
+  }
+
+  Future<void> _handleOverflowButtonPressed(
+    List<IosKeyboardAttachmentActionConfig> nativeActions,
+  ) async {
+    ConduitHaptics.selectionClick();
+
+    if (!kIsWeb && Platform.isIOS && nativeActions.isNotEmpty) {
+      // These actions were built by the latest build, for its account.
+      _nativeConnectionsOwner = _builtNativeConnectionsOwner;
+      final handled = await _toggleNativeKeyboardAttachmentPanel(nativeActions);
+      if (handled) {
+        return;
+      }
+    }
+
+    if (mounted && !_isDeactivated) {
+      _toggleFallbackAttachmentPanel();
+    }
+  }
+
+  void _toggleFallbackAttachmentPanel() {
+    if (!widget.enabled || _isRecording) return;
+
+    if (_isFallbackAttachmentPanelVisible) {
+      final restoreKeyboard = _fallbackPanelReplacedKeyboard;
+      if (restoreKeyboard) {
+        if (widget.managesSystemKeyboardInset) {
+          setState(() {
+            _fallbackPanelWaitingForKeyboard = true;
+          });
+        }
+        _restoreSystemKeyboard(preferImmediate: true);
+      }
+      if (!restoreKeyboard || !widget.managesSystemKeyboardInset) {
+        _dismissFallbackAttachmentPanel();
+      }
+      return;
+    }
+
+    final keyboardHeight = MediaQuery.viewInsetsOf(context).bottom;
+    final platformView = View.of(context);
+    final bottomSafeInset =
+        platformView.viewPadding.bottom / platformView.devicePixelRatio;
+    final availableHeight = MediaQuery.sizeOf(context).height;
+    final preferredHeight = fallbackAttachmentPanelHeight(
+      keyboardHeight: keyboardHeight,
+      bottomSafeInset: bottomSafeInset,
+      retainedSafeAreaOverlap: Spacing.xxs,
+      availableHeight: availableHeight,
+    );
+
+    setState(() {
+      _fallbackPanelReplacedKeyboard = _focusNode.hasFocus;
+      _fallbackAttachmentPanelHeight = widget.managesSystemKeyboardInset
+          ? (keyboardHeight > 0 ? keyboardHeight + Spacing.sm : preferredHeight)
+          : preferredHeight;
+      _isFallbackAttachmentPanelVisible = true;
+      _fallbackPanelWaitingForKeyboard = false;
+    });
+    try {
+      ref.read(composerHasFocusProvider.notifier).set(true);
+    } catch (_) {}
+    // Preserve the EditableText input connection while replacing the IME
+    // region. This mirrors iOS input-view swapping and avoids a visible
+    // focus loss when the attachment keyboard opens.
+    if (_fallbackPanelReplacedKeyboard) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !_isFallbackAttachmentPanelVisible) return;
+        try {
+          unawaited(
+            SystemChannels.textInput.invokeMethod<void>('TextInput.hide'),
+          );
+        } catch (_) {}
+      });
+    }
+  }
+
+  void _dismissFallbackAttachmentPanel() {
+    if (!_isFallbackAttachmentPanelVisible) return;
+    setState(() {
+      _isFallbackAttachmentPanelVisible = false;
+      _fallbackPanelReplacedKeyboard = false;
+      _fallbackPanelWaitingForKeyboard = false;
+    });
+    try {
+      ref.read(composerHasFocusProvider.notifier).set(_focusNode.hasFocus);
+    } catch (_) {}
+  }
+
+  void _restoreSystemKeyboard({bool preferImmediate = false}) {
+    if (!mounted || _isDeactivated || !widget.enabled) return;
+    try {
+      ref.read(composerAutofocusEnabledProvider.notifier).set(true);
+    } catch (_) {}
+    _ensureFocusedIfEnabled();
+    if (preferImmediate && _focusNode.hasFocus) {
+      try {
+        unawaited(
+          SystemChannels.textInput.invokeMethod<void>('TextInput.show'),
+        );
+      } catch (_) {}
+      return;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || _isDeactivated || !widget.enabled) return;
+      try {
+        unawaited(
+          SystemChannels.textInput.invokeMethod<void>('TextInput.show'),
+        );
+      } catch (_) {}
+    });
+  }
+
+  Future<bool> _toggleNativeKeyboardAttachmentPanel(
+    List<IosKeyboardAttachmentActionConfig> actions,
+  ) async {
+    if (!widget.enabled) return false;
+    final handled = await IosKeyboardAttachmentBridge.instance.toggle(
+      actions: actions,
+    );
+    if (!handled) {
+      return false;
+    }
+
+    if (!_focusNode.hasFocus && !_isNativeAttachmentPanelVisible) {
+      try {
+        ref.read(composerAutofocusEnabledProvider.notifier).set(true);
+      } catch (_) {}
+      _ensureFocusedIfEnabled();
+    }
+
+    return true;
+  }
+
+  Future<void> _hideNativeKeyboardAttachmentPanel() async {
+    if (kIsWeb || !Platform.isIOS || !_isNativeAttachmentPanelVisible) {
+      return;
+    }
+    await IosKeyboardAttachmentBridge.instance.hide();
+  }
+
+  Future<void> _hideAttachmentPanels({
+    bool restoreFallbackKeyboard = false,
+  }) async {
+    final shouldRestoreFallbackKeyboard =
+        restoreFallbackKeyboard && _isFallbackAttachmentPanelVisible;
+    if (shouldRestoreFallbackKeyboard) {
+      if (widget.managesSystemKeyboardInset && _fallbackPanelReplacedKeyboard) {
+        setState(() {
+          _fallbackPanelWaitingForKeyboard = true;
+        });
+      }
+      _restoreSystemKeyboard(preferImmediate: true);
+    }
+    if (_isFallbackAttachmentPanelVisible &&
+        (!_fallbackPanelWaitingForKeyboard ||
+            !widget.managesSystemKeyboardInset)) {
+      _dismissFallbackAttachmentPanel();
+    }
+    await _hideNativeKeyboardAttachmentPanel();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    ref.listen<bool>(composerAutofocusEnabledProvider, (previous, next) {
+      if ((previous ?? true) && !next) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted || _isDeactivated) return;
+          if (_focusNode.hasFocus) {
+            _focusNode.unfocus();
+          }
+          if (_isFallbackAttachmentPanelVisible) {
+            _dismissFallbackAttachmentPanel();
+          }
+        });
+      }
+    });
+
+    ref.listen<String?>(prefilledInputTextProvider, (previous, next) {
+      final incoming = next?.trim();
+      if (incoming == null || incoming.isEmpty) return;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || _isDeactivated) return;
+        _controller.text = incoming;
+        _controller.selection = TextSelection.collapsed(
+          offset: incoming.length,
+        );
+        try {
+          ref.read(prefilledInputTextProvider.notifier).clear();
+        } catch (_) {}
+      });
+    });
+    ref.listen<ComposerTextInsertion?>(composerTextInsertionProvider, (
+      previous,
+      next,
+    ) {
+      if (next == null ||
+          next.text.isEmpty ||
+          next.targetId != _composerTextInsertionTargetId) {
+        return;
+      }
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || _isDeactivated) return;
+        _insertTextAtCurrentSelection(next.text);
+        try {
+          ref.read(composerTextInsertionProvider.notifier).clear(next.id);
+        } catch (_) {}
+      });
+    });
+    ref.listen<bool>(webSearchAvailableProvider, (previous, next) {
+      _scheduleNativeKeyboardAttachmentSync();
+    });
+    ref.listen<bool>(webSearchEnabledProvider, (previous, next) {
+      _scheduleNativeKeyboardAttachmentSync();
+    });
+    ref.listen<bool>(imageGenerationAvailableProvider, (previous, next) {
+      _scheduleNativeKeyboardAttachmentSync();
+    });
+    ref.listen<bool>(imageGenerationEnabledProvider, (previous, next) {
+      _scheduleNativeKeyboardAttachmentSync();
+    });
+    ref.listen<CodeInterpreterOffer?>(codeInterpreterOfferProvider, (
+      previous,
+      next,
+    ) {
+      _scheduleNativeKeyboardAttachmentSync();
+    });
+    ref.listen<List<String>>(selectedToolIdsProvider, (previous, next) {
+      _scheduleNativeKeyboardAttachmentSync();
+    });
+    ref.listen<List<String>>(selectedFilterIdsProvider, (previous, next) {
+      _scheduleNativeKeyboardAttachmentSync();
+    });
+    ref.listen<AsyncValue<List<Tool>>>(toolsListProvider, (previous, next) {
+      _scheduleNativeKeyboardAttachmentSync();
+    });
+    ref.listen<Model?>(selectedModelProvider, (previous, next) {
+      _scheduleNativeKeyboardAttachmentSync();
+    });
+    ref.listen(hermesCapabilitiesProvider, (previous, next) {
+      _scheduleNativeKeyboardAttachmentSync();
+    });
+
+    // Use dedicated streaming provider to avoid rebuilding on every message change
+    final localTurnIsGenerating = ref.watch(isChatStreamingProvider);
+    final stopGeneration = ref.read(stopGenerationProvider);
+
+    // Watch only upload send-state booleans so metadata/progress churn does not
+    // fan out through the whole composer.
+    final hasUploadsInProgress = ref.watch(
+      attachedFilesProvider.select(
+        (files) => files.any(
+          (f) =>
+              f.status == FileUploadStatus.uploading ||
+              f.status == FileUploadStatus.pending,
+        ),
+      ),
+    );
+    final allUploadsComplete = ref.watch(
+      attachedFilesProvider.select(
+        (files) =>
+            files.isEmpty ||
+            files.every((f) => f.status == FileUploadStatus.completed),
+      ),
+    );
+
+    final webSearchEnabled = ref.watch(webSearchEnabledProvider);
+    final webSearchAvailable = ref.watch(webSearchAvailableProvider);
+    final imageGenEnabled = ref.watch(imageGenerationEnabledProvider);
+    final imageGenAvailable = ref.watch(imageGenerationAvailableProvider);
+    final codeInterpreterOffer = ref.watch(codeInterpreterOfferProvider);
+    final l10n = AppLocalizations.of(context)!;
+    final notesEnabled = ref.watch(notesFeatureEnabledProvider);
+    final showNotesButton = ref.watch(
+      appSettingsProvider.select(
+        (settings) => settings.showComposerNotesButton,
+      ),
+    );
+    final isCreatingDraftNote = ref.watch(
+      noteCreatorProvider.select((state) => state.isLoading),
+    );
+    final selectedQuickPills = ref.watch(
+      appSettingsProvider.select((s) => s.quickPills),
+    );
+    final sendOnEnter = ref.watch(
+      appSettingsProvider.select((s) => s.sendOnEnter),
+    );
+    final selectedComposerModel = ref.watch(selectedModelProvider);
+    final isDirectComposer =
+        selectedComposerModel != null &&
+        hasReservedDirectIdentity(selectedComposerModel);
+    final directToolsAvailable =
+        isDirectComposer &&
+        directBindingSupportsLocalMcp(
+          ref.watch(directModelRegistryProvider).resolve(selectedComposerModel),
+        );
+    final toolsAsync = isDirectComposer
+        ? const AsyncData<List<Tool>>([])
+        : ref.watch(toolsListProvider);
+    final directMcpToolsAsync = directToolsAvailable
+        ? ref.watch(directMcpToolsProvider)
+        : const AsyncData<List<Tool>>([]);
+    if (isDirectComposer) {
+      ref.listen<AsyncValue<List<Tool>>>(directMcpToolsProvider, (
+        previous,
+        next,
+      ) {
+        _scheduleNativeKeyboardAttachmentSync();
+      });
+      ref.watch(directMcpServersProvider);
+    } else if (!kIsWeb &&
+        Platform.isIOS &&
+        !(selectedComposerModel != null &&
+            isHermesModel(selectedComposerModel))) {
+      // The native panel offers the account's personal tool servers and
+      // terminals, so it follows their settings, availability and owner.
+      ref.listen(personalConnectionsSessionProvider, (previous, next) {
+        _scheduleNativeKeyboardAttachmentSync();
+      });
+      ref.listen(personalConnectionsProvider, (previous, next) {
+        _scheduleNativeKeyboardAttachmentSync();
+      });
+      ref.listen(terminalAvailableServersProvider, (previous, next) {
+        _scheduleNativeKeyboardAttachmentSync();
+      });
+      ref.listen<String?>(selectedTerminalIdProvider, (previous, next) {
+        _scheduleNativeKeyboardAttachmentSync();
+      });
+    }
+    final bool showWebPill = selectedQuickPills.contains('web');
+    final bool showImagePillPref = selectedQuickPills.contains('image');
+    final voiceAvailableAsync = ref.watch(voiceInputAvailableProvider);
+    final bool voiceAvailable = voiceAvailableAsync.maybeWhen(
+      data: (v) => v,
+      orElse: () => false,
+    );
+    final selectedToolIds = ref.watch(selectedToolIdsProvider);
+    final selectedFilterIds = ref.watch(selectedFilterIdsProvider);
+
+    // Get filters from the selected model for quick pills
+    final availableFilters = ref.watch(
+      selectedModelProvider.select(
+        (model) => model?.filters ?? const <ToggleFilter>[],
+      ),
+    );
+    // Hermes uses its own `/` skills and only exposes local attachment actions.
+    // Keep OpenWebUI quick pills hidden while allowing the attachment button to
+    // follow the server's explicit image-input capability.
+    final bool isHermesComposer = ref.watch(
+      selectedModelProvider.select((m) => m != null && isHermesModel(m)),
+    );
+    final bool isDesktopHermesComposer =
+        isHermesComposer &&
+        ref.watch(hermesConfigProvider.select((config) => config.mode)) ==
+            HermesBackendMode.desktopGateway;
+    final desktopTurnState = ref
+        .watch(hermesDesktopTurnStateProvider)
+        .asData
+        ?.value;
+    final isGenerating =
+        localTurnIsGenerating ||
+        (isDesktopHermesComposer &&
+            desktopTurnState == HermesDesktopTurnState.running);
+    final desktopTurnControlsSupported =
+        !isDesktopHermesComposer ||
+        desktopTurnState != HermesDesktopTurnState.unsupportedGateway;
+    // Watching the capabilities value makes a loading -> data transition
+    // rebuild the composer. Attachment access still fails closed below.
+    ref.watch(hermesCapabilitiesProvider);
+    final visionCapableModelIds = ref.watch(visionCapableModelsProvider);
+    ref.watch(fileUploadCapableModelsProvider);
+    final attachmentAvailability = _overflowAttachmentAvailability;
+    final List<Tool> availableTools =
+        (isDirectComposer ? directMcpToolsAsync : toolsAsync)
+            .maybeWhen<List<Tool>>(
+              data: (tools) => tools,
+              orElse: () => const <Tool>[],
+            );
+    final directSupportsImages =
+        !isDirectComposer ||
+        (visionCapableModelIds.contains(selectedComposerModel.id) &&
+            (attachmentAvailability.photo || attachmentAvailability.camera));
+    final showOverflowButton = shouldShowComposerOverflowButton(
+      isHermesComposer: isHermesComposer,
+      isDirectComposer: isDirectComposer,
+      directSupportsImages: directSupportsImages,
+      directHasOverflowActions:
+          attachmentAvailability.file ||
+          attachmentAvailability.mcpContent ||
+          webSearchAvailable ||
+          imageGenAvailable ||
+          (isDirectComposer && availableTools.isNotEmpty),
+      hermesHasLocalAttachmentActions:
+          attachmentAvailability.file ||
+          attachmentAvailability.photo ||
+          attachmentAvailability.camera,
+    );
+    final compactControls = _compactComposerControls(
+      showOverflowButton: showOverflowButton,
+      voiceAvailable: voiceAvailable,
+      isGenerating: isGenerating,
+    );
+    if (_isFallbackAttachmentPanelVisible && !showOverflowButton) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && !_isDeactivated) {
+          _dismissFallbackAttachmentPanel();
+        }
+      });
+    }
+    final nativeConnections =
+        !kIsWeb && Platform.isIOS && !isHermesComposer && !isDirectComposer
+        ? readComposerPersonalConnections(ref.watch)
+        : ComposerPersonalConnections.none;
+    _builtNativeConnectionsOwner = nativeConnections.owner;
+    final nativeAttachmentActions = _nativeKeyboardAttachmentActions(
+      l10n: l10n,
+      webSearchAvailable: webSearchAvailable,
+      webSearchEnabled: webSearchEnabled,
+      imageGenerationAvailable: imageGenAvailable,
+      imageGenerationEnabled: imageGenEnabled,
+      availableTools: availableTools,
+      selectedToolIds: selectedToolIds,
+      availableFilters: availableFilters,
+      selectedFilterIds: selectedFilterIds,
+      connections: nativeConnections,
+      toolSettingsAvailable: ref.watch(personalValvesCommandAvailableProvider),
+      compareModelsAvailable: _comparisonCommandAvailable(ref.watch),
+      hasMessage: _hasText,
+      codeInterpreter: codeInterpreterOffer,
+    );
+
+    final focusTick = ref.watch(inputFocusTriggerProvider);
+    final autofocusEnabled = ref.watch(composerAutofocusEnabledProvider);
+    if (autofocusEnabled && focusTick != _lastHandledFocusTick) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || _isDeactivated) return;
+        _ensureFocusedIfEnabled();
+        _lastHandledFocusTick = focusTick;
+      });
+    }
+
+    final Brightness brightness = Theme.of(context).brightness;
+
+    // Keep mention highlight colors in sync with the theme.
+    final mentionColor = context.conduitTheme.buttonPrimary;
+    _controller.mentionColor = mentionColor;
+    _controller.mentionBackground = mentionColor.withValues(alpha: 0.12);
+
+    final bool hasComposerFocus = _hasComposerFocus;
+    final bool isActive = hasComposerFocus || _hasText || _isRecording;
+    final Color placeholderColor = context.conduitTheme.textSecondary
+        .withValues(alpha: 0.5);
+    final Color placeholderBase = placeholderColor;
+    final Color placeholderFocused = placeholderColor;
+    final List<Widget> quickPills = <Widget>[];
+
+    for (final id in selectedQuickPills) {
+      if (isHermesComposer || isDirectComposer) {
+        break;
+      }
+      final filterId = ComposerOverflowActionIds.filterIdFrom(id);
+      if (id == 'web' && showWebPill && webSearchAvailable) {
+        final String label = AppLocalizations.of(context)!.web;
+        final IconData icon = Platform.isIOS
+            ? CupertinoIcons.search
+            : Icons.search;
+        void handleTap() {
+          final notifier = ref.read(webSearchEnabledProvider.notifier);
+          notifier.set(!webSearchEnabled);
+        }
+
+        quickPills.add(
+          _buildPillButton(
+            icon: icon,
+            label: label,
+            isActive: webSearchEnabled,
+            dense: true,
+            onTap: widget.enabled && !_isRecording ? handleTap : null,
+          ),
+        );
+      } else if (id == 'image' && showImagePillPref && imageGenAvailable) {
+        final String label = AppLocalizations.of(context)!.imageGen;
+        final IconData icon = Platform.isIOS
+            ? CupertinoIcons.photo
+            : Icons.image;
+        void handleTap() {
+          setComposerOverflowSelection(
+            ref,
+            actionId: ComposerOverflowActionIds.imageGeneration,
+            selected: !imageGenEnabled,
+          );
+        }
+
+        quickPills.add(
+          _buildPillButton(
+            icon: icon,
+            label: label,
+            isActive: imageGenEnabled,
+            dense: true,
+            onTap: widget.enabled && !_isRecording ? handleTap : null,
+          ),
+        );
+      } else if (filterId != null) {
+        // Handle filter quick pills
+        ToggleFilter? filter;
+        for (final f in availableFilters) {
+          if (f.id == filterId) {
+            filter = f;
+            break;
+          }
+        }
+        if (filter != null) {
+          final bool isSelected = selectedFilterIds.contains(filterId);
+          final String label = filter.name;
+          final IconData icon = Platform.isIOS
+              ? CupertinoIcons.sparkles
+              : Icons.auto_awesome;
+
+          void handleTap() {
+            ref.read(selectedFilterIdsProvider.notifier).toggle(filterId);
+          }
+
+          quickPills.add(
+            _buildPillButton(
+              icon: icon,
+              label: label,
+              isActive: isSelected,
+              dense: true,
+              onTap: widget.enabled && !_isRecording ? handleTap : null,
+              iconUrl: filter.icon,
+            ),
+          );
+        }
+      } else {
+        // Handle tool quick pills
+        Tool? tool;
+        for (final t in availableTools) {
+          if (t.id == id) {
+            tool = t;
+            break;
+          }
+        }
+        if (tool != null) {
+          final bool isSelected = selectedToolIds.contains(id);
+          final String label = tool.name;
+          final IconData icon = Platform.isIOS
+              ? CupertinoIcons.wrench
+              : Icons.build;
+
+          void handleTap() {
+            final current = List<String>.from(selectedToolIds);
+            if (current.contains(id)) {
+              current.remove(id);
+            } else {
+              current.add(id);
+            }
+            ref.read(selectedToolIdsProvider.notifier).set(current);
+          }
+
+          quickPills.add(
+            _buildPillButton(
+              icon: icon,
+              label: label,
+              isActive: isSelected,
+              dense: true,
+              onTap: widget.enabled && !_isRecording ? handleTap : null,
+            ),
+          );
+        }
+      }
+    }
+
+    // A chosen code interpreter stays in view, and can be turned off here,
+    // even when it can no longer run. Then it reads as inactive, with a
+    // warning glyph, and a tap says why before offering to turn it off.
+    if (codeInterpreterOffer?.selected == true &&
+        !isHermesComposer &&
+        !isDirectComposer) {
+      final block = codeInterpreterOffer!.block;
+      final blockReason = block == null
+          ? null
+          : codeInterpreterBlockReason(l10n, block);
+      quickPills.add(
+        _buildPillButton(
+          key: const ValueKey<String>('composer-code-interpreter-pill'),
+          icon: blockReason != null
+              ? (Platform.isIOS
+                    ? CupertinoIcons.exclamationmark_triangle
+                    : Icons.warning_amber_rounded)
+              : (Platform.isIOS
+                    ? CupertinoIcons.chevron_left_slash_chevron_right
+                    : Icons.code),
+          iconColor: blockReason != null ? context.conduitTheme.warning : null,
+          label: l10n.codeInterpreter,
+          isActive: blockReason == null,
+          dense: true,
+          semanticsHint: blockReason,
+          onTap: !widget.enabled || _isRecording
+              ? null
+              : blockReason != null
+              ? () => _explainBlockedCodeInterpreter(blockReason)
+              : () => setComposerOverflowSelection(
+                  ref,
+                  actionId: ComposerOverflowActionIds.codeInterpreter,
+                  selected: false,
+                ),
+        ),
+      );
+    }
+
+    // Keep focused single-line input compact. Move to the two-tier shell only
+    // when the text becomes multiline or selected quick pills need a row.
+    // At accessibility text sizes, keeping the growing controls and editable
+    // text in one row can leave too little width for even the placeholder.
+    // Use the existing two-tier layout so Dynamic Type remains uncapped and
+    // every control keeps its full touch target.
+    // A message typed during a response can be queued, which needs room for the
+    // Queue action beside Stop, as Hermes's turn actions do.
+    final bool showQueueAction =
+        _hasText && isGenerating && ref.watch(chatDraftQueueOfferProvider);
+    final bool showCompactComposer =
+        conduitSystemControlScaleOf(context) <=
+            _maxCompactComposerControlScale &&
+        quickPills.isEmpty &&
+        !_isMultiline &&
+        !showQueueAction &&
+        !(isDesktopHermesComposer && isGenerating && _hasText);
+    final bool showCreateDraftNoteAction =
+        !showCompactComposer &&
+        notesEnabled &&
+        showNotesButton &&
+        _hasText &&
+        !isGenerating &&
+        !_isRecording;
+    final bool showInlineMicAction =
+        !_isRecording && !_hasText && voiceAvailable && !isGenerating;
+
+    const double compactRadius = AppBorderRadius.round;
+    const double expandedRadius = _composerRadius;
+    final BorderRadius shellRadius = BorderRadius.circular(
+      showCompactComposer ? compactRadius : expandedRadius,
+    );
+
+    late final Widget shellContent;
+    Widget? compactPromptOverlay;
+
+    if (!showCompactComposer) {
+      final List<Widget> composerChildren = <Widget>[
+        Flexible(
+          child: _buildExpandedComposerEditor(
+            Padding(
+              key: const ValueKey('composer-expanded-input'),
+              padding: const EdgeInsets.fromLTRB(
+                _composerHorizontalInset,
+                Spacing.sm,
+                _composerHorizontalInset,
+                Spacing.sm,
+              ),
+              child: Stack(
+                children: [
+                  Padding(
+                    padding: EdgeInsetsDirectional.only(
+                      end: _showExpandButton && !_expandModalOpen
+                          ? conduitScaledIconExtent(context, IconSize.large) +
+                                (Spacing.xs * 3)
+                          : 0,
+                    ),
+                    child: _buildComposerTextField(
+                      brightness: brightness,
+                      sendOnEnter: sendOnEnter,
+                      voiceAvailable: voiceAvailable,
+                      isGenerating: isGenerating,
+                      desktopTurnRunning:
+                          isDesktopHermesComposer &&
+                          desktopTurnState == HermesDesktopTurnState.running,
+                      allUploadsComplete: allUploadsComplete,
+                      placeholderBase: placeholderBase,
+                      placeholderFocused: placeholderFocused,
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: Spacing.sm,
+                        vertical: Spacing.xs,
+                      ),
+                      isActive: isActive,
+                    ),
+                  ),
+                  if (_showExpandButton && !_expandModalOpen)
+                    PositionedDirectional(
+                      top: Spacing.xs,
+                      end: Spacing.xs,
+                      child: _buildExpandButton(_showExpandTextModal),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ),
+        Padding(
+          key: const ValueKey('composer-expanded-buttons'),
+          padding: const EdgeInsets.fromLTRB(
+            _composerHorizontalInset,
+            0,
+            _composerHorizontalInset,
+            _composerActionRowBottomInset,
+          ),
+          child: Row(
+            children: [
+              if (_isRecording) ...[
+                _buildDictationStopButton(size: _composerControlSize),
+                const SizedBox(width: Spacing.xs),
+              ] else if (showOverflowButton) ...[
+                _buildOverflowButton(
+                  tooltip: l10n.more,
+                  dense: true,
+                  nativeActions: nativeAttachmentActions,
+                ),
+                const SizedBox(width: Spacing.xs),
+              ],
+              if (quickPills.isNotEmpty)
+                Expanded(
+                  child: HorizontalOverflowFade(
+                    child: HorizontalScrollGestureBoundary(
+                      child: SingleChildScrollView(
+                        key: const ValueKey('composer-quick-pills'),
+                        scrollDirection: Axis.horizontal,
+                        physics: const BouncingScrollPhysics(),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: _withHorizontalSpacing(
+                            quickPills,
+                            Spacing.xxs,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                )
+              else
+                const Spacer(),
+              if (isDesktopHermesComposer &&
+                  desktopTurnControlsSupported &&
+                  desktopTurnState == HermesDesktopTurnState.running &&
+                  _hasText) ...[
+                _buildPillButton(
+                  icon: Icons.turn_right_rounded,
+                  label: l10n.hermesTurnSteer,
+                  isActive: true,
+                  dense: true,
+                  onTap:
+                      widget.enabled &&
+                          !_isRecording &&
+                          !_desktopQueueActionBusy
+                      ? () => unawaited(_sendDesktopBusyMessage(steer: true))
+                      : null,
+                ),
+                const SizedBox(width: Spacing.xs),
+                _buildPillButton(
+                  icon: Icons.queue_rounded,
+                  label: l10n.hermesTurnSendNext,
+                  isActive: false,
+                  dense: true,
+                  onTap:
+                      widget.enabled &&
+                          !_isRecording &&
+                          !_desktopQueueActionBusy
+                      ? () => unawaited(_sendDesktopBusyMessage(steer: false))
+                      : null,
+                ),
+              ],
+              if (showQueueAction) ...[
+                _buildPillButton(
+                  icon: Platform.isIOS
+                      ? CupertinoIcons.list_bullet
+                      : Icons.queue_rounded,
+                  label: l10n.queueDraftAction,
+                  isActive: true,
+                  dense: true,
+                  // _queueDraft gives the one haptic, and only if it queued.
+                  haptic: false,
+                  onTap: widget.enabled && !_isRecording ? _queueDraft : null,
+                ),
+                const SizedBox(width: Spacing.xs),
+              ],
+              if (showCreateDraftNoteAction) ...[
+                const SizedBox(width: Spacing.xs),
+                _buildCreateDraftNoteButton(isLoading: isCreatingDraftNote),
+              ],
+              if (showInlineMicAction) ...[
+                const SizedBox(width: Spacing.xs),
+                _buildInlineMicAction(voiceAvailable),
+              ],
+              if (!showCreateDraftNoteAction && !showInlineMicAction)
+                const SizedBox(width: Spacing.xs),
+              _buildPrimaryButton(
+                _hasText,
+                isGenerating,
+                stopGeneration,
+                voiceAvailable,
+                allUploadsComplete,
+                hasUploadsInProgress,
+                dense: true,
+              ),
+            ],
+          ),
+        ),
+      ];
+
+      // Only the editor and suggestions yield height; actions never scroll.
+      // The text field handles scrolling after reaching its line or height cap.
+      shellContent = KeyedSubtree(
+        key: const ValueKey('expanded-composer-shell'),
+        child: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxHeight: MediaQuery.of(context).size.height * 0.4,
+          ),
+          // Keep text-entry height changes direct. AnimatedSize here runs on
+          // each new or removed line, making the composer trail the user's
+          // typing and repeatedly relaying out the chat viewport.
+          child: RepaintBoundary(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: composerChildren,
+            ),
+          ),
+        ),
+      );
+    } else {
+      // Compact mode keeps every action inside one full-width shell. Matching
+      // control sizes and insets make the resting row mirror the focused shell.
+      final textFieldContent = Container(
+        key: const ValueKey('compact-composer-content'),
+        height: conduitScaledControlExtent(
+          context,
+          baseExtent: _composerControlSize,
+        ),
+        padding: const EdgeInsets.fromLTRB(
+          _composerHorizontalInset,
+          0,
+          _composerHorizontalInset,
+          _composerActionRowBottomInset,
+        ),
+        alignment: Alignment.center,
+        child: Stack(
+          clipBehavior: Clip.none,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                if (_isRecording) ...[
+                  _buildDictationStopButton(size: _composerControlSize),
+                  const SizedBox(width: Spacing.xs),
+                ] else if (compactControls.showLeading) ...[
+                  _buildOverflowButton(
+                    tooltip: l10n.more,
+                    dense: true,
+                    nativeActions: nativeAttachmentActions,
+                  ),
+                  const SizedBox(width: Spacing.xs),
+                ],
+                Expanded(
+                  child: _buildComposerTextField(
+                    brightness: brightness,
+                    sendOnEnter: sendOnEnter,
+                    voiceAvailable: voiceAvailable,
+                    isGenerating: isGenerating,
+                    desktopTurnRunning:
+                        isDesktopHermesComposer &&
+                        desktopTurnState == HermesDesktopTurnState.running,
+                    allUploadsComplete: allUploadsComplete,
+                    placeholderBase: placeholderBase,
+                    placeholderFocused: placeholderFocused,
+                    contentPadding: const EdgeInsets.symmetric(
+                      vertical: Spacing.xs,
+                    ),
+                    isActive: isActive,
+                  ),
+                ),
+                if (compactControls.showMic) ...[
+                  const SizedBox(width: Spacing.xs),
+                  SizedBox(
+                    height: conduitScaledControlExtent(
+                      context,
+                      baseExtent: _composerControlSize,
+                    ),
+                    child: Center(
+                      child: _buildInlineMicAction(
+                        voiceAvailable,
+                        size: _composerControlSize,
+                      ),
+                    ),
+                  ),
+                ],
+                if (!compactControls.showMic) const SizedBox(width: Spacing.xs),
+                _buildPrimaryButton(
+                  _hasText,
+                  isGenerating,
+                  stopGeneration,
+                  voiceAvailable,
+                  allUploadsComplete,
+                  hasUploadsInProgress,
+                  dense: true,
+                ),
+              ],
+            ),
+          ],
+        ),
+      );
+
+      shellContent = KeyedSubtree(
+        key: const ValueKey('compact-composer-shell'),
+        child: textFieldContent,
+      );
+      compactPromptOverlay = _shouldShowPromptOverlay
+          ? Padding(
+              padding: const EdgeInsets.only(bottom: Spacing.xs),
+              child: _buildActiveOverlay(),
+            )
+          : null;
+    }
+
+    // Keep the native backdrop in one stable element slot when the composer
+    // crosses between compact and expanded layouts. Replacing the platform
+    // view here forces UIKit to allocate a fresh IOSurface for the same glass
+    // material, which is substantially more expensive than swapping only the
+    // Flutter-owned foreground content.
+    final Widget shell = _wrapIosSurfaceShadow(
+      _buildComposerShell(
+        key: const ValueKey('composer-native-shell'),
+        borderRadius: shellRadius,
+        isRecording: _isRecording,
+        child: shellContent,
+      ),
+      borderRadius: shellRadius,
+    );
+
+    // Wrap with padding for floating effect, accounting for safe area
+    final bottomPadding = _composerBottomPadding(context);
+    final composer = Padding(
+      padding: EdgeInsets.fromLTRB(
+        Spacing.screenPadding,
+        0,
+        Spacing.screenPadding,
+        bottomPadding,
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (widget.attachedOverlay != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: Spacing.xs),
+              child: widget.attachedOverlay!,
+            ),
+          ?compactPromptOverlay,
+          const ChatDraftQueueRow(),
+          shell,
+        ],
+      ),
+    );
+    return _wrapWithComposerLineMeasurement(
+      compactControls: compactControls,
+      child: _wrapWithFallbackAttachmentPanel(
+        composer: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [const SpeechPlaybackBar(), composer],
+        ),
+        localAttachmentsOnly: isHermesComposer,
+        attachmentAvailability: attachmentAvailability,
+      ),
+    );
+  }
+
+  Widget _wrapWithComposerLineMeasurement({
+    required Widget child,
+    required _CompactComposerControls compactControls,
+  }) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final controlSize = conduitScaledControlExtent(
+          context,
+          baseExtent: _composerControlSize,
+        );
+        var reservedWidth = controlSize + Spacing.xs;
+        if (compactControls.showLeading) {
+          reservedWidth += controlSize + Spacing.xs;
+        }
+        if (compactControls.showMic) {
+          reservedWidth += controlSize + Spacing.xs;
+        }
+        final compactTextFieldWidth =
+            constraints.maxWidth -
+            (Spacing.screenPadding * 2) -
+            (_composerHorizontalInset * 2) -
+            reservedWidth;
+        _scheduleComposerLineMeasurement(context, compactTextFieldWidth);
+        return child;
+      },
+    );
+  }
+
+  Widget _wrapWithFallbackAttachmentPanel({
+    required Widget composer,
+    required bool localAttachmentsOnly,
+    required ComposerOverflowAttachmentAvailability attachmentAvailability,
+  }) {
+    final fallbackPanel = ComposerAttachmentKeyboard(
+      height: _fallbackAttachmentPanelHeight,
+      localAttachmentsOnly: localAttachmentsOnly,
+      onDismiss: _dismissFallbackAttachmentPanel,
+      onFileAttachment: attachmentAvailability.file
+          ? widget.onFileAttachment
+          : null,
+      onServerFileAttachment: attachmentAvailability.serverFile
+          ? widget.onServerFileAttachment
+          : null,
+      onImageAttachment: attachmentAvailability.photo
+          ? widget.onImageAttachment
+          : null,
+      onCameraCapture: attachmentAvailability.camera
+          ? widget.onCameraCapture
+          : null,
+      onWebAttachment: attachmentAvailability.web
+          ? widget.onWebAttachment
+          : null,
+      onMcpContent: attachmentAvailability.mcpContent
+          ? _openDirectMcpContent
+          : null,
+      onToolSettings: ref.watch(personalValvesCommandAvailableProvider)
+          ? _openToolSettings
+          : null,
+      onCompareModels: _comparisonCommandAvailable(ref.watch)
+          ? () => unawaited(_openCompareModels())
+          : null,
+      compareModelsHasMessage: _hasText,
+    );
+
+    return PopScope(
+      canPop: !_isFallbackAttachmentPanelVisible,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && _isFallbackAttachmentPanelVisible) {
+          if (_fallbackPanelReplacedKeyboard) {
+            if (widget.managesSystemKeyboardInset) {
+              setState(() {
+                _fallbackPanelWaitingForKeyboard = true;
+              });
+            }
+            _restoreSystemKeyboard(preferImmediate: true);
+          }
+          if (!_fallbackPanelReplacedKeyboard ||
+              !widget.managesSystemKeyboardInset) {
+            _dismissFallbackAttachmentPanel();
+          }
+        }
+      },
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ComposerRecordings(
+            key: ValueKey(ref.watch(composerDraftContextProvider)),
+            owner: ref.watch(composerDraftContextProvider),
+            activeId: _isRecording ? _recordingSession?.id : null,
+            transcribing: _isTranscribing,
+            transcriptionErrorId: _recordingTranscriptionErrorId,
+            captureErrorId: _recordingCaptureErrorId,
+            onTranscribingChanged: _recordingTranscribingChanged,
+            onInsert: _appendRecordingTranscription,
+          ),
+          composer,
+          if (widget.managesSystemKeyboardInset)
+            SizedBox(
+              height: _isFallbackAttachmentPanelVisible
+                  ? _fallbackAttachmentPanelHeight
+                  : MediaQuery.viewInsetsOf(context).bottom > 0
+                  ? MediaQuery.viewInsetsOf(context).bottom + Spacing.sm
+                  : math.max(
+                      View.of(context).viewPadding.bottom /
+                          View.of(context).devicePixelRatio,
+                      Spacing.sm,
+                    ),
+              child: _isFallbackAttachmentPanelVisible
+                  ? fallbackPanel
+                  : const SizedBox.shrink(),
+            )
+          else
+            ClipRect(
+              child: AnimatedSize(
+                duration: context.motionDuration(
+                  const Duration(milliseconds: 220),
+                ),
+                curve: Curves.easeOutCubic,
+                alignment: Alignment.topCenter,
+                child: _isFallbackAttachmentPanelVisible
+                    ? fallbackPanel
+                    : const SizedBox.shrink(),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  // (Removed legacy _buildVoiceButton; mic functionality moved to primary button)
+
+  List<Widget> _withHorizontalSpacing(List<Widget> children, double gap) {
+    if (children.length <= 1) {
+      return List<Widget>.from(children);
+    }
+    final result = <Widget>[];
+    for (var i = 0; i < children.length; i++) {
+      result.add(children[i]);
+      if (i != children.length - 1) {
+        result.add(SizedBox(width: gap));
+      }
+    }
+    return result;
+  }
+
+  /// Leaves room for one scaled editor line when suggestions share its height.
+  Widget _buildExpandedComposerEditor(Widget editor) {
+    if (!_shouldShowPromptOverlay) return editor;
+    final typography = _composerTypography(context);
+    final painter = TextPainter(
+      text: TextSpan(text: ' ', style: typography.style),
+      textDirection: typography.direction,
+      textScaler: typography.textScaler,
+      locale: typography.locale,
+    );
+    final double minimumEditorHeight;
+    try {
+      // Include the outer input padding and the text field's own padding.
+      minimumEditorHeight =
+          painter.preferredLineHeight + 2 * (Spacing.sm + Spacing.xs);
+    } finally {
+      painter.dispose();
+    }
+    return LayoutBuilder(
+      builder: (context, constraints) => Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ConstrainedBox(
+            constraints: BoxConstraints(
+              maxHeight: math.max(
+                0,
+                math.min(
+                  constraints.maxHeight / 2,
+                  constraints.maxHeight - minimumEditorHeight,
+                ),
+              ),
+            ),
+            child: Padding(
+              key: const ValueKey('prompt-overlay'),
+              padding: const EdgeInsets.fromLTRB(
+                Spacing.sm,
+                0,
+                Spacing.sm,
+                Spacing.xs,
+              ),
+              child: _buildActiveOverlay(),
+            ),
+          ),
+          Flexible(child: editor),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildComposerTextField({
+    required Brightness brightness,
+    required bool sendOnEnter,
+    required bool voiceAvailable,
+    required bool isGenerating,
+    required bool desktopTurnRunning,
+    required bool allUploadsComplete,
+    required Color placeholderBase,
+    required Color placeholderFocused,
+    required EdgeInsetsGeometry contentPadding,
+    required bool isActive,
+  }) {
+    return GestureDetector(
+      key: _textFieldKey,
+      behavior: HitTestBehavior.opaque,
+      // Exclude from semantics so screen readers interact directly with the
+      // TextField, which provides its own accessibility via hintText.
+      excludeFromSemantics: true,
+      onTap: () {
+        if (!widget.enabled) return;
+        unawaited(_hideAttachmentPanels(restoreFallbackKeyboard: true));
+        // Explicit user intent to focus: re-enable autofocus and focus
+        try {
+          ref.read(composerAutofocusEnabledProvider.notifier).set(true);
+        } catch (_) {}
+        _ensureFocusedIfEnabled();
+      },
+      child: Shortcuts(
+        shortcuts: () {
+          final map = <LogicalKeySet, Intent>{
+            LogicalKeySet(LogicalKeyboardKey.meta, LogicalKeyboardKey.enter):
+                const SendMessageIntent(),
+            LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.enter):
+                const SendMessageIntent(),
+          };
+          if (sendOnEnter) {
+            map[LogicalKeySet(LogicalKeyboardKey.enter)] =
+                const SendMessageIntent();
+            map[LogicalKeySet(
+                  LogicalKeyboardKey.shift,
+                  LogicalKeyboardKey.enter,
+                )] =
+                const InsertNewlineIntent();
+          }
+          if (_shouldShowPromptOverlay) {
+            map[LogicalKeySet(LogicalKeyboardKey.arrowDown)] =
+                const SelectNextPromptIntent();
+            map[LogicalKeySet(LogicalKeyboardKey.arrowUp)] =
+                const SelectPreviousPromptIntent();
+            map[LogicalKeySet(LogicalKeyboardKey.escape)] =
+                const DismissPromptIntent();
+          }
+          return map;
+        }(),
+        child: Actions(
+          actions: <Type, Action<Intent>>{
+            SendMessageIntent: CallbackAction<SendMessageIntent>(
+              onInvoke: (intent) {
+                if (_canConfirmPromptSelection) {
+                  _confirmPromptSelection();
+                  return null;
+                }
+                if (desktopTurnRunning) {
+                  unawaited(_sendDesktopBusyMessage(steer: false));
+                } else {
+                  _sendMessage();
+                }
+                return null;
+              },
+            ),
+            InsertNewlineIntent: CallbackAction<InsertNewlineIntent>(
+              onInvoke: (intent) {
+                _insertNewline();
+                return null;
+              },
+            ),
+            SelectNextPromptIntent: CallbackAction<SelectNextPromptIntent>(
+              onInvoke: (intent) {
+                _movePromptSelection(1);
+                return null;
+              },
+            ),
+            SelectPreviousPromptIntent:
+                CallbackAction<SelectPreviousPromptIntent>(
+                  onInvoke: (intent) {
+                    _movePromptSelection(-1);
+                    return null;
+                  },
+                ),
+            DismissPromptIntent: CallbackAction<DismissPromptIntent>(
+              onInvoke: (intent) {
+                _hidePromptOverlay();
+                return null;
+              },
+            ),
+          },
+          child: Builder(
+            builder: (context) {
+              final double factor = isActive ? 1.0 : 0.0;
+              final Color animatedPlaceholder = Color.lerp(
+                placeholderBase,
+                placeholderFocused,
+                factor,
+              )!;
+              final textLabel = context.conduitTheme.inputText;
+              final Color animatedTextColor = Color.lerp(
+                textLabel.withValues(alpha: 0.88),
+                textLabel,
+                factor,
+              )!;
+
+              final TextStyle baseChatStyle = _composerInputTextStyle(
+                _isRecording,
+              );
+              final inputPlaceholder = _isTranscribing
+                  ? AppLocalizations.of(context)!.transcribingAudio
+                  : _isRecording
+                  ? AppLocalizations.of(context)!.recordingAudio
+                  : widget.placeholder ??
+                        AppLocalizations.of(context)!.messageHintText;
+
+              // IMPORTANT: Always use TextInputAction.newline for multiline
+              // chat input. Using TextInputAction.send causes issues with
+              // Braille keyboards (like Advanced Braille Keyboard) where
+              // the "confirm" action is used to commit characters, not to
+              // send messages. The send-on-enter functionality is handled
+              // by keyboard shortcuts (Enter key) instead.
+              if (!kIsWeb && Theme.of(context).platform == TargetPlatform.iOS) {
+                final usesNativePlatformView = conduitSupportsNativeGlass();
+                return CupertinoTextField(
+                  controller: _controller,
+                  focusNode: _focusNode,
+                  placeholder: inputPlaceholder,
+                  placeholderStyle: baseChatStyle.copyWith(
+                    color: animatedPlaceholder,
+                  ),
+                  enabled: widget.enabled,
+                  autofocus: false,
+                  minLines: 1,
+                  maxLines: 8,
+                  textAlignVertical: TextAlignVertical.center,
+                  keyboardType: TextInputType.multiline,
+                  textCapitalization: TextCapitalization.sentences,
+                  textInputAction: TextInputAction.newline,
+                  autofillHints: const <String>[],
+                  showCursor: true,
+                  cursorOpacityAnimates: composerCursorOpacityAnimates(
+                    usesNativePlatformView: usesNativePlatformView,
+                  ),
+                  cursorColor: Theme.of(context).textSelectionTheme.cursorColor,
+                  magnifierConfiguration: usesNativePlatformView
+                      ? IosTextMagnifier.configuration
+                      : null,
+                  scrollPadding: const EdgeInsets.only(bottom: 80),
+                  keyboardAppearance: brightness,
+                  style: baseChatStyle.copyWith(color: animatedTextColor),
+                  contentInsertionConfiguration: _selectedModelAcceptsImageInput
+                      ? ContentInsertionConfiguration(
+                          allowedMimeTypes: ClipboardAttachmentService
+                              .supportedImageMimeTypes
+                              .toList(),
+                          onContentInserted: _handleContentInserted,
+                        )
+                      : null,
+                  // Transparent decoration, the glass container provides
+                  // the visual frame.
+                  decoration: const BoxDecoration(),
+                  padding: contentPadding,
+                  contextMenuBuilder: (context, editableTextState) {
+                    return _buildIosContextMenu(context, editableTextState);
+                  },
+                  onSubmitted: (_) {},
+                  onTap: () {
+                    if (!widget.enabled) return;
+                    unawaited(
+                      _hideAttachmentPanels(restoreFallbackKeyboard: true),
+                    );
+                    _ensureFocusedIfEnabled();
+                  },
+                );
+              }
+              return TextField(
+                controller: _controller,
+                focusNode: _focusNode,
+                enabled: widget.enabled,
+                autofocus: false,
+                minLines: 1,
+                maxLines: 8,
+                textAlignVertical: TextAlignVertical.center,
+                keyboardType: TextInputType.multiline,
+                textCapitalization: TextCapitalization.sentences,
+                textInputAction: TextInputAction.newline,
+                autofillHints: const <String>[],
+                showCursor: true,
+                scrollPadding: const EdgeInsets.only(bottom: 80),
+                keyboardAppearance: brightness,
+                magnifierConfiguration: nativeIosTextMagnifierConfiguration,
+                style: baseChatStyle.copyWith(color: animatedTextColor),
+                decoration: context.conduitInputStyles
+                    .borderless(hint: inputPlaceholder)
+                    .copyWith(
+                      hintStyle: baseChatStyle.copyWith(
+                        color: animatedPlaceholder,
+                        fontWeight: FontWeight.w300,
+                      ),
+                      contentPadding: contentPadding,
+                      isDense: true,
+                      alignLabelWithHint: true,
+                    ),
+                // Enable pasting images and files from clipboard
+                contentInsertionConfiguration: _selectedModelAcceptsImageInput
+                    ? ContentInsertionConfiguration(
+                        allowedMimeTypes: ClipboardAttachmentService
+                            .supportedImageMimeTypes
+                            .toList(),
+                        onContentInserted: _handleContentInserted,
+                      )
+                    : null,
+                // Use Flutter's standard text-editing context menu. Images
+                // arrive through ContentInsertionConfiguration/native paste.
+                contextMenuBuilder: (context, editableTextState) {
+                  return _buildFallbackContextMenu(context, editableTextState);
+                },
+                onSubmitted: (_) {},
+                onTap: () {
+                  if (!widget.enabled) return;
+                  unawaited(
+                    _hideAttachmentPanels(restoreFallbackKeyboard: true),
+                  );
+                  _ensureFocusedIfEnabled();
+                },
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildOverflowButton({
+    required String tooltip,
+    bool dense = false,
+    List<IosKeyboardAttachmentActionConfig> nativeActions = const [],
+  }) {
+    final double buttonSize = conduitScaledControlExtent(
+      context,
+      baseExtent: dense ? _composerControlSize : TouchTarget.minimum,
+    );
+    // Let the parent supply a completely custom overflow button.
+    if (widget.overflowButtonBuilder != null) {
+      return widget.overflowButtonBuilder!(buttonSize);
+    }
+
+    final bool enabled = widget.enabled && !_isRecording;
+
+    final bool attachmentPanelVisible =
+        (!kIsWeb && Platform.isIOS && _isNativeAttachmentPanelVisible) ||
+        _isFallbackAttachmentPanelVisible;
+    final theme = context.conduitTheme;
+
+    final Color iconColor = !enabled
+        ? theme.textPrimary.withValues(alpha: Alpha.disabled)
+        : attachmentPanelVisible
+        ? theme.textPrimary.withValues(alpha: Alpha.strong)
+        : theme.textPrimary.withValues(alpha: Alpha.strong);
+
+    final isIOS = PlatformInfo.isIOS;
+    final IconData overflowIcon;
+    if (attachmentPanelVisible) {
+      overflowIcon = isIOS ? CupertinoIcons.xmark : Icons.close;
+    } else {
+      overflowIcon = isIOS ? CupertinoIcons.add : Icons.add;
+    }
+    // Material's add/close glyphs have a lighter, more compact drawn bound
+    // than their Cupertino counterparts. Use the standard Material action
+    // extent so they do not look undersized inside the shared 44pt target.
+    final iconSize = conduitScaledIconExtent(
+      context,
+      isIOS
+          ? _cupertinoComposerOverflowIconExtent
+          : _materialComposerOverflowIconExtent,
+    );
+
+    return Focus(
+      key: const ValueKey('composer-overflow-button'),
+      canRequestFocus: false,
+      skipTraversal: true,
+      descendantsAreFocusable: false,
+      child: AdaptiveTooltip(
+        message: tooltip,
+        child: _buildComposerIconButton(
+          onPressed: enabled
+              ? () {
+                  unawaited(_handleOverflowButtonPressed(nativeActions));
+                }
+              : null,
+          size: buttonSize,
+          forcePlain: true,
+          iosSymbol: attachmentPanelVisible ? 'xmark' : 'plus',
+          iosSymbolSize: iconSize,
+          iosSymbolColor: iconColor,
+          child: ConduitSystemAdaptiveIcon(
+            overflowIcon,
+            size: iconSize,
+            color: iconColor,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildExpandButton(VoidCallback onTap) {
+    final iconSize = conduitScaledIconExtent(context, IconSize.large);
+    final iconColor = context.conduitTheme.textSecondary.withValues(alpha: 0.7);
+    return AdaptiveTooltip(
+      message: AppLocalizations.of(context)!.edit,
+      child: GestureDetector(
+        key: const ValueKey<String>('composer-expand-button'),
+        onTap: onTap,
+        behavior: HitTestBehavior.opaque,
+        child: Padding(
+          padding: const EdgeInsets.all(Spacing.xs),
+          child: ConduitSystemAdaptiveIcon(
+            Platform.isIOS
+                ? CupertinoIcons.arrow_up_left_arrow_down_right
+                : Icons.open_in_full,
+            size: iconSize,
+            color: iconColor,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDictationStopButton({double? size}) {
+    final theme = context.conduitTheme;
+    final baseSize = size ?? TouchTarget.minimum;
+    final buttonSize = conduitScaledControlExtent(
+      context,
+      baseExtent: baseSize,
+    );
+    final iconSize = conduitScaledIconExtent(context, IconSize.medium);
+    final background = theme.surfaceContainerHighest.withValues(alpha: 0.96);
+    final border = theme.cardBorder.withValues(alpha: 0.75);
+
+    return AdaptiveTooltip(
+      message: AppLocalizations.of(context)!.stopRecording,
+      child: GestureDetector(
+        key: const ValueKey('composer-dictation-stop-button'),
+        behavior: HitTestBehavior.opaque,
+        onTap: widget.enabled
+            ? () {
+                unawaited(_stopVoice());
+              }
+            : null,
+        child: Container(
+          width: buttonSize,
+          height: buttonSize,
+          decoration: BoxDecoration(
+            color: background,
+            shape: BoxShape.circle,
+            border: Border.all(color: border, width: BorderWidth.thin),
+          ),
+          child: Center(
+            child: ConduitSystemAdaptiveIcon(
+              Platform.isIOS ? CupertinoIcons.stop_fill : Icons.stop_rounded,
+              size: iconSize,
+              color: theme.textPrimary.withValues(alpha: Alpha.strong),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildInlineMicAction(bool voiceAvailable, {double? size}) {
+    final bool enabledMic = widget.enabled && (voiceAvailable || _isRecording);
+    final theme = context.conduitTheme;
+    final bool active = _isRecording;
+    final double buttonSize = conduitScaledControlExtent(
+      context,
+      baseExtent: size ?? _composerControlSize,
+    );
+    final iconSize = conduitScaledIconExtent(context, IconSize.large);
+    final IconData iconData = active
+        ? (Platform.isIOS ? CupertinoIcons.stop_fill : Icons.stop_rounded)
+        : (Platform.isIOS ? CupertinoIcons.mic : Icons.mic);
+    final Color iconColor = active
+        ? theme.buttonPrimaryText
+        : theme.textSecondary.withValues(
+            alpha: enabledMic ? Alpha.strong : Alpha.disabled,
+          );
+    final icon = AnimatedSwitcher(
+      duration: context.motionDuration(const Duration(milliseconds: 160)),
+      switchInCurve: Curves.easeOutCubic,
+      switchOutCurve: Curves.easeInCubic,
+      transitionBuilder: (child, animation) {
+        if (context.reduceMotion) {
+          return child;
+        }
+        final scale = Tween<double>(begin: 0.94, end: 1).animate(
+          CurvedAnimation(
+            parent: animation,
+            curve: Curves.easeOutCubic,
+            reverseCurve: Curves.easeInCubic,
+          ),
+        );
+        return FadeTransition(
+          opacity: animation,
+          child: ScaleTransition(scale: scale, child: child),
+        );
+      },
+      child: ConduitSystemAdaptiveIcon(
+        iconData,
+        key: ValueKey<IconData>(iconData),
+        size: iconSize,
+        color: iconColor,
+      ),
+    );
+    final onPressed = enabledMic
+        ? () {
+            ConduitHaptics.selectionClick();
+            _toggleVoice();
+          }
+        : null;
+
+    return AdaptiveTooltip(
+      message: active
+          ? AppLocalizations.of(context)!.stopRecording
+          : AppLocalizations.of(context)!.startDictation,
+      child: GestureDetector(
+        key: ValueKey<String>(
+          active ? 'composer-dictation-stop' : 'composer-dictation-start',
+        ),
+        behavior: HitTestBehavior.opaque,
+        onTap: onPressed,
+        child: SizedBox.square(
+          dimension: buttonSize,
+          child: Align(
+            alignment: AlignmentDirectional.centerEnd,
+            child: Padding(
+              padding: const EdgeInsetsDirectional.only(
+                end: _composerTrailingAccessoryInset,
+              ),
+              child: icon,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCreateDraftNoteButton({required bool isLoading}) {
+    final l10n = AppLocalizations.of(context)!;
+    final bool enabled = widget.enabled && !isLoading && !_isRecording;
+    final buttonSize = conduitScaledControlExtent(
+      context,
+      baseExtent: _composerControlSize,
+    );
+    final iconSize = conduitScaledIconExtent(context, IconSize.medium);
+    final visualSize = conduitScaledControlExtent(
+      context,
+      baseExtent: _composerPrimaryVisualSize,
+    );
+    final iconColor = enabled
+        ? context.conduitTheme.textSecondary.withValues(alpha: Alpha.strong)
+        : context.conduitTheme.textSecondary.withValues(alpha: Alpha.disabled);
+
+    return AdaptiveTooltip(
+      message: l10n.createNote,
+      child: _buildComposerIconButton(
+        key: const ValueKey('create-draft-note-button'),
+        onPressed: enabled ? _createNoteFromDraft : null,
+        size: buttonSize,
+        visualSize: visualSize,
+        visualAlignment: AlignmentDirectional.centerEnd,
+        forcePlain: true,
+        iosSymbol: isLoading ? null : 'doc.text',
+        iosSymbolColor: iconColor,
+        child: isLoading
+            ? SizedBox(
+                width: iconSize,
+                height: iconSize,
+                child: AdaptiveProgressIndicator(
+                  strokeWidth: 2.5,
+                  color: context.conduitTheme.textSecondary,
+                ),
+              )
+            : ConduitSystemAdaptiveIcon(
+                Platform.isIOS
+                    ? CupertinoIcons.doc_text
+                    : Icons.note_add_outlined,
+                size: iconSize,
+                color: iconColor,
+              ),
+      ),
+    );
+  }
+
+  Widget _buildPrimaryButton(
+    bool hasText,
+    bool isGenerating,
+    void Function() stopGeneration,
+    bool voiceAvailable,
+    bool allUploadsComplete,
+    bool hasUploadsInProgress, {
+    bool dense = false,
+  }) {
+    final double buttonSize = conduitScaledControlExtent(
+      context,
+      baseExtent: dense ? _composerControlSize : TouchTarget.minimum,
+    );
+    final double primaryVisualSize = conduitScaledControlExtent(
+      context,
+      baseExtent: _composerPrimaryVisualSize,
+    );
+    // Cupertino's arrow and waveform symbols have a larger optical footprint.
+    // Material's corresponding glyphs need the regular action extent to read
+    // clearly inside the same 32pt visual button.
+    final primaryIconSize = conduitScaledIconExtent(
+      context,
+      Platform.isIOS ? IconSize.small : IconSize.medium,
+    );
+
+    // Don't allow sending until all uploads are complete.
+    final enabled =
+        !isGenerating && hasText && widget.enabled && allUploadsComplete;
+
+    // Generating -> STOP variant
+    if (isGenerating) {
+      final stopLabel = AppLocalizations.of(context)!.stopGenerating;
+      return AdaptiveTooltip(
+        message: stopLabel,
+        child: _buildComposerIconButton(
+          key: const ValueKey('primary-btn-stop'),
+          onPressed: () {
+            ConduitHaptics.lightImpact();
+            stopGeneration();
+          },
+          size: buttonSize,
+          visualSize: primaryVisualSize,
+          semanticLabel: stopLabel,
+          iosSymbolSize: primaryIconSize,
+          isProminent: true,
+          iosSymbol: 'stop.fill',
+          iosSymbolColor: context.conduitTheme.buttonPrimaryText,
+          child: ConduitSystemAdaptiveIcon(
+            Platform.isIOS ? CupertinoIcons.stop_fill : Icons.stop,
+            size: primaryIconSize,
+            color: context.conduitTheme.buttonPrimaryText,
+          ),
+        ),
+      );
+    }
+
+    // Dictation only adds text to the draft. Keep its stop/transcribe action
+    // separate from sending, including while the server is transcribing.
+    if (_isRecording || _isTranscribing || _isRecoveringRecording) {
+      return SizedBox.square(dimension: buttonSize);
+    }
+
+    if (hasText) {
+      final onPressed = enabled ? _sendMessage : null;
+      final sendChild = hasUploadsInProgress
+          ? SizedBox(
+              width: primaryIconSize,
+              height: primaryIconSize,
+              child: AdaptiveProgressIndicator(
+                strokeWidth: 2.5,
+                color: context.conduitTheme.textSecondary,
+              ),
+            )
+          : ConduitSystemAdaptiveIcon(
+              Platform.isIOS
+                  ? CupertinoIcons.arrow_up
+                  : Icons.arrow_upward_rounded,
+              size: primaryIconSize,
+              color: enabled
+                  ? context.conduitTheme.buttonPrimaryText
+                  : context.conduitTheme.textPrimary.withValues(
+                      alpha: Alpha.disabled,
+                    ),
+            );
+      return AdaptiveTooltip(
+        message: enabled
+            ? AppLocalizations.of(context)!.sendMessage
+            : AppLocalizations.of(context)!.send,
+        child: _buildComposerIconButton(
+          key: const ValueKey('primary-btn-send'),
+          onPressed: onPressed,
+          size: buttonSize,
+          visualSize: primaryVisualSize,
+          semanticLabel: enabled
+              ? AppLocalizations.of(context)!.sendMessage
+              : AppLocalizations.of(context)!.send,
+          iosSymbolSize: primaryIconSize,
+          isProminent: true,
+          iosSymbol: hasUploadsInProgress ? null : 'arrow.up',
+          iosSymbolColor: enabled
+              ? context.conduitTheme.buttonPrimaryText
+              : context.conduitTheme.textPrimary.withValues(
+                  alpha: Alpha.disabled,
+                ),
+          child: sendChild,
+        ),
+      );
+    }
+
+    // VOICE CALL variant when no text is present and voice is available.
+    // Otherwise fall back to a muted send button.
+    if (widget.onVoiceCall != null) {
+      final bool enabledVoiceCall = widget.enabled && !_isRecording;
+      return AdaptiveTooltip(
+        message: AppLocalizations.of(context)!.voiceCallTitle,
+        child: _buildComposerIconButton(
+          key: const ValueKey('primary-btn-voice-call'),
+          onPressed: enabledVoiceCall
+              ? () {
+                  PlatformUtils.lightHaptic();
+                  widget.onVoiceCall!();
+                }
+              : null,
+          size: buttonSize,
+          visualSize: primaryVisualSize,
+          semanticLabel: AppLocalizations.of(context)!.voiceCallTitle,
+          iosSymbolSize: primaryIconSize,
+          isProminent: true,
+          iosSymbol: 'waveform',
+          iosSymbolColor: enabledVoiceCall
+              ? context.conduitTheme.buttonPrimaryText
+              : context.conduitTheme.textPrimary.withValues(
+                  alpha: Alpha.disabled,
+                ),
+          child: ConduitSystemAdaptiveIcon(
+            Platform.isIOS ? CupertinoIcons.waveform : Icons.graphic_eq,
+            size: primaryIconSize,
+            color: enabledVoiceCall
+                ? context.conduitTheme.buttonPrimaryText
+                : context.conduitTheme.textPrimary.withValues(
+                    alpha: Alpha.disabled,
+                  ),
+          ),
+        ),
+      );
+    }
+
+    // Muted send button when no text and no voice call.
+    return _buildComposerIconButton(
+      key: const ValueKey('primary-btn-send-muted'),
+      onPressed: null,
+      size: buttonSize,
+      visualSize: primaryVisualSize,
+      semanticLabel: AppLocalizations.of(context)!.send,
+      iosSymbolSize: primaryIconSize,
+      isProminent: false,
+      iosSymbol: 'arrow.up',
+      iosSymbolColor: context.conduitTheme.textPrimary.withValues(
+        alpha: Alpha.disabled,
+      ),
+      child: ConduitSystemAdaptiveIcon(
+        Platform.isIOS ? CupertinoIcons.arrow_up : Icons.arrow_upward_rounded,
+        size: primaryIconSize,
+        color: context.conduitTheme.textPrimary.withValues(
+          alpha: Alpha.disabled,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPillButton({
+    Key? key,
+    required IconData icon,
+    required String label,
+    required bool isActive,
+    VoidCallback? onTap,
+    String? iconUrl,
+    bool dense = false,
+    bool haptic = true,
+    Color? iconColor,
+    String? semanticsHint,
+  }) {
+    final bool enabled = onTap != null;
+    final theme = context.conduitTheme;
+
+    final Color background = isActive
+        ? theme.buttonPrimary.withValues(alpha: 0.10)
+        : Colors.transparent;
+
+    final Color borderColor = isActive
+        ? theme.buttonPrimary.withValues(alpha: 0.4)
+        : theme.cardBorder;
+
+    final Color textColor = isActive
+        ? theme.textPrimary
+        : theme.textSecondary.withValues(alpha: enabled ? 1.0 : Alpha.disabled);
+
+    final Color glyphColor =
+        iconColor ?? (isActive ? theme.buttonPrimary : textColor);
+
+    return Semantics(
+      key: key,
+      button: true,
+      enabled: enabled,
+      hint: semanticsHint,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: onTap == null
+            ? null
+            : () {
+                if (haptic) ConduitHaptics.mediumImpact();
+                onTap();
+              },
+        child: AnimatedContainer(
+          duration: context.motionDuration(const Duration(milliseconds: 200)),
+          curve: Curves.easeOutCubic,
+          padding: EdgeInsets.symmetric(
+            horizontal: dense ? Spacing.sm : Spacing.md,
+            vertical: dense ? (Spacing.xs + 1) : (Spacing.sm - 2),
+          ),
+          decoration: BoxDecoration(
+            color: background,
+            borderRadius: BorderRadius.circular(AppBorderRadius.round),
+            border: Border.all(color: borderColor, width: BorderWidth.thin),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              iconUrl != null && iconUrl.isNotEmpty
+                  ? ModelAvatar(
+                      size: IconSize.chip,
+                      imageUrl: iconUrl,
+                      label: label,
+                    )
+                  : Icon(icon, size: IconSize.chip, color: glyphColor),
+              SizedBox(width: dense ? Spacing.xs : Spacing.xs + 1),
+              AnimatedDefaultTextStyle(
+                duration: context.motionDuration(
+                  const Duration(milliseconds: 200),
+                ),
+                curve: Curves.easeOutCubic,
+                style: AppTypography.labelMediumStyle.copyWith(
+                  color: textColor,
+                  fontWeight: isActive ? FontWeight.w600 : FontWeight.w500,
+                  letterSpacing: AppTypography.letterSpacingNormal,
+                ),
+                child: Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Builds an icon button for the composer.
+  ///
+  /// Uses native glass only where iOS supports it; older iOS follows the same
+  /// opaque fallback treatment as Android.
+  Widget _buildComposerIconButton({
+    Key? key,
+    required VoidCallback? onPressed,
+    required Widget child,
+    required double size,
+    double? visualSize,
+    AlignmentGeometry visualAlignment = Alignment.center,
+    String? semanticLabel,
+    double? iosSymbolSize,
+    bool isProminent = false,
+    bool androidShowBackground = false,
+    bool forcePlain = false,
+    Color? color,
+    String? iosSymbol,
+    Color? iosSymbolColor,
+  }) {
+    final theme = context.conduitTheme;
+    final effectiveColor = color ?? theme.buttonPrimary;
+    final androidBackgroundColor =
+        color ?? theme.surfaceContainerHighest.withValues(alpha: 0.95);
+
+    // iOS glass buttons are UIKit platform views. Remove them while another
+    // route covers the composer so their compositor layer cannot bleed
+    // through an opaque Flutter modal sheet.
+    if (conduitSupportsNativeGlass() && !forcePlain && !_isRouteVisible) {
+      return SizedBox.square(dimension: size);
+    }
+
+    final effectiveVisualSize = (visualSize ?? size)
+        .clamp(0.0, size)
+        .toDouble();
+    final keyBelongsToOuterTarget = effectiveVisualSize < size;
+
+    final usesOpaqueFallback = conduitUsesOpaqueGlassFallback();
+    final buttonStyle = forcePlain
+        ? AdaptiveButtonStyle.plain
+        : usesOpaqueFallback
+        ? (isProminent || androidShowBackground
+              ? AdaptiveButtonStyle.filled
+              : AdaptiveButtonStyle.plain)
+        : (isProminent
+              ? AdaptiveButtonStyle.prominentGlass
+              : AdaptiveButtonStyle.glass);
+
+    final adaptiveSize = size > 40
+        ? AdaptiveButtonSize.large
+        : AdaptiveButtonSize.medium;
+    final buttonColor =
+        usesOpaqueFallback && androidShowBackground && !isProminent
+        ? androidBackgroundColor
+        : effectiveColor;
+
+    // A visually plain action gains no glass material from a UIKit platform
+    // view. Keep those controls in Flutter so the plus/close, expand, and note
+    // actions do not each allocate and composite their own IOSurface.
+    if (conduitSupportsNativeGlass() && !forcePlain) {
+      // Loading indicators are transient Flutter content. Keeping them out of
+      // child-mode avoids creating another persistent platform view.
+      if (iosSymbol == null) {
+        final loadingButton = Semantics(
+          key: keyBelongsToOuterTarget ? null : key,
+          button: true,
+          enabled: onPressed != null,
+          child: SizedBox.square(
+            dimension: effectiveVisualSize,
+            child: isProminent
+                ? DecoratedBox(
+                    decoration: BoxDecoration(
+                      color: buttonColor,
+                      shape: BoxShape.circle,
+                    ),
+                    child: Center(child: child),
+                  )
+                : Center(child: child),
+          ),
+        );
+        return _wrapComposerVisualControl(
+          key: key,
+          onPressed: onPressed,
+          semanticLabel: semanticLabel,
+          targetSize: size,
+          visualSize: effectiveVisualSize,
+          visualAlignment: visualAlignment,
+          control: loadingButton,
+        );
+      }
+      final nativeButton = SizedBox.square(
+        dimension: effectiveVisualSize,
+        child: _StableNativeComposerIconButton(
+          key: keyBelongsToOuterTarget ? null : key,
+          onPressed: onPressed,
+          enabled: onPressed != null,
+          symbol: SFSymbol(
+            iosSymbol,
+            size: iosSymbolSize ?? kCupertinoNativeControlSymbolExtent,
+            color: iosSymbolColor,
+          ),
+          style: buttonStyle,
+          color: buttonColor,
+          size: adaptiveSize,
+          dimension: effectiveVisualSize,
+        ),
+      );
+      return _wrapComposerVisualControl(
+        key: key,
+        onPressed: onPressed,
+        semanticLabel: semanticLabel,
+        targetSize: size,
+        visualSize: effectiveVisualSize,
+        visualAlignment: visualAlignment,
+        control: nativeButton,
+      );
+    }
+
+    final fallbackButton = SizedBox.square(
+      dimension: effectiveVisualSize,
+      child: AdaptiveButton.child(
+        key: keyBelongsToOuterTarget ? null : key,
+        onPressed: onPressed,
+        enabled: onPressed != null,
+        style: buttonStyle,
+        color: buttonColor,
+        size: adaptiveSize,
+        minSize: Size.square(effectiveVisualSize),
+        padding: EdgeInsets.zero,
+        borderRadius: BorderRadius.circular(effectiveVisualSize),
+        useSmoothRectangleBorder: false,
+        child: child,
+      ),
+    );
+    return _wrapComposerVisualControl(
+      key: key,
+      onPressed: onPressed,
+      semanticLabel: semanticLabel,
+      targetSize: size,
+      visualSize: effectiveVisualSize,
+      visualAlignment: visualAlignment,
+      control: fallbackButton,
+    );
+  }
+
+  Widget _wrapComposerVisualControl({
+    required Key? key,
+    required VoidCallback? onPressed,
+    required String? semanticLabel,
+    required double targetSize,
+    required double visualSize,
+    required AlignmentGeometry visualAlignment,
+    required Widget control,
+  }) {
+    if (visualSize >= targetSize) return control;
+
+    return Semantics(
+      key: key,
+      button: true,
+      enabled: onPressed != null,
+      label: semanticLabel,
+      onTap: onPressed,
+      child: SizedBox.square(
+        dimension: targetSize,
+        child: Stack(
+          alignment: visualAlignment,
+          children: [
+            Positioned.fill(
+              child: ExcludeSemantics(
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: onPressed,
+                ),
+              ),
+            ),
+            ExcludeSemantics(child: control),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Builds the composer shell container.
+  ///
+  /// Uses native glass on iOS 26+ and a themed opaque surface elsewhere.
+  Widget _buildComposerShell({
+    Key? key,
+    required Widget child,
+    required BorderRadius borderRadius,
+    bool isRecording = false,
+  }) {
+    final theme = context.conduitTheme;
+    final recordingBorderColor = theme.buttonPrimary.withValues(alpha: 0.56);
+    final recordingSurfaceColor = Color.alphaBlend(
+      theme.buttonPrimary.withValues(alpha: 0.045),
+      theme.surfaceContainerHighest,
+    );
+
+    if (conduitSupportsNativeGlass() && _isRouteVisible) {
+      return Stack(
+        key: key,
+        fit: StackFit.passthrough,
+        children: [
+          Positioned.fill(
+            child: IgnorePointer(child: _composerGlassBackdrop(borderRadius)),
+          ),
+          Positioned.fill(
+            child: IgnorePointer(
+              child: AnimatedContainer(
+                duration: context.motionDuration(
+                  const Duration(milliseconds: 160),
+                ),
+                curve: Curves.easeOutCubic,
+                decoration: BoxDecoration(
+                  borderRadius: borderRadius,
+                  border: Border.all(
+                    color: isRecording
+                        ? recordingBorderColor
+                        : Colors.transparent,
+                    width: isRecording ? BorderWidth.thin * 1.5 : 0,
+                  ),
+                ),
+              ),
+            ),
+          ),
+          child,
+        ],
+      );
+    }
+
+    return AnimatedContainer(
+      key: key,
+      duration: context.motionDuration(const Duration(milliseconds: 160)),
+      curve: Curves.easeOutCubic,
+      decoration: BoxDecoration(
+        color: isRecording
+            ? recordingSurfaceColor
+            : theme.surfaceContainerHighest,
+        borderRadius: borderRadius,
+      ),
+      // Paint the state border over the surface instead of letting
+      // BoxDecoration contribute its width to the child's layout. This keeps
+      // the compact composer at the same 44pt control extent and prevents the
+      // thicker recording border from shifting its contents.
+      foregroundDecoration: BoxDecoration(
+        borderRadius: borderRadius,
+        border: Border.all(
+          color: isRecording ? recordingBorderColor : theme.cardBorder,
+          width: isRecording ? BorderWidth.thin * 1.5 : BorderWidth.thin,
+        ),
+      ),
+      child: child,
+    );
+  }
+
+  Widget _composerGlassBackdrop(BorderRadius borderRadius) {
+    final cached = _cachedComposerGlassBackdrop;
+    if (cached != null && _cachedComposerGlassRadius == borderRadius) {
+      return cached;
+    }
+
+    final backdrop = AdaptiveGlassBackdrop(
+      key: const ValueKey('composer-native-glass-backdrop'),
+      borderRadius: borderRadius,
+    );
+    _cachedComposerGlassRadius = borderRadius;
+    _cachedComposerGlassBackdrop = backdrop;
+    return backdrop;
+  }
+
+  double _composerBottomPadding(BuildContext context) {
+    if (widget.bottomPadding case final bottomPadding?) {
+      return bottomPadding;
+    }
+
+    if (!kIsWeb && Platform.isIOS) {
+      return Spacing.md * 2;
+    }
+
+    return MediaQuery.viewPaddingOf(context).bottom + Spacing.md;
+  }
+
+  Widget _wrapIosSurfaceShadow(
+    Widget child, {
+    BorderRadius borderRadius = const BorderRadius.all(
+      Radius.circular(AppBorderRadius.round),
+    ),
+  }) {
+    final isLight = Theme.of(context).brightness == Brightness.light;
+    if (!isLight || !_isRouteVisible) return child;
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        borderRadius: borderRadius,
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x18000000),
+            blurRadius: 16,
+            spreadRadius: -2,
+            offset: Offset(0, 4),
+          ),
+          BoxShadow(
+            color: Color(0x0A000000),
+            blurRadius: 4,
+            spreadRadius: 0,
+            offset: Offset(0, 1),
+          ),
+        ],
+      ),
+      child: child,
+    );
+  }
+
+  void _showExpandTextModal() async {
+    if (Platform.isIOS) {
+      final l10n = AppLocalizations.of(context)!;
+      final draftKey = composerDraftKey(ref.read(composerDraftContextProvider));
+      bool ownsInput() =>
+          mounted &&
+          draftKey == composerDraftKey(ref.read(composerDraftContextProvider));
+      void applyText(String text) {
+        if (!ownsInput() || _controller.text == text) return;
+        _controller.value = TextEditingValue(
+          text: text,
+          selection: TextSelection.collapsed(offset: text.length),
+        );
+      }
+
+      final changes = NativeSheetBridge.instance.events.listen((event) {
+        if (event is NativeSheetControlChanged &&
+            event.id == 'expanded-text-value' &&
+            event.value is String) {
+          applyText(event.value as String);
+        }
+      });
+      setState(() => _expandModalOpen = true);
+      try {
+        final result = await NativeSheetBridge.instance.presentTextEditor(
+          title: widget.placeholder ?? l10n.sendMessage,
+          value: _controller.text,
+          placeholder: widget.placeholder ?? l10n.messageHintText,
+          sendLabel: _queuesInsteadOfSending
+              ? l10n.queueDraftAction
+              : l10n.send,
+          valueId: 'expanded-text-value',
+          emitChanges: true,
+          sendActionId: 'send-expanded-text',
+          closeActionId: 'close-expanded-text',
+          rethrowErrors: true,
+        );
+        final updatedText = result?.values['expanded-text-value'] as String?;
+        if (updatedText != null) applyText(updatedText);
+        if (mounted) {
+          setState(() => _expandModalOpen = false);
+        }
+        if (result?.actionId == 'send-expanded-text' && ownsInput()) {
+          _sendMessage();
+        }
+        return;
+      } catch (_) {
+        if (!mounted) {
+          return;
+        }
+        setState(() => _expandModalOpen = false);
+      } finally {
+        await changes.cancel();
+      }
+    }
+
+    final modalController = TextEditingController(text: _controller.text);
+
+    void syncToMain() {
+      if (!mounted) return;
+      if (_controller.text != modalController.text) {
+        _controller.value = TextEditingValue(
+          text: modalController.text,
+          selection: TextSelection.collapsed(
+            offset: modalController.text.length,
+          ),
+        );
+      }
+    }
+
+    modalController.addListener(syncToMain);
+    setState(() => _expandModalOpen = true);
+
+    if (!mounted) {
+      return;
+    }
+
+    ThemedSheets.showCustom<bool>(
+      context: context,
+      isScrollControlled: true,
+      enableDrag: true,
+      useSafeArea: true,
+      builder: (modalContext) => ExpandedTextEditorSheet(
+        controller: modalController,
+        onClose: () {
+          FocusScope.of(modalContext).unfocus();
+          Navigator.of(modalContext).pop(false);
+        },
+        onSend: () {
+          FocusScope.of(modalContext).unfocus();
+          Navigator.of(modalContext).pop(true);
+        },
+      ),
+    ).then((shouldSend) {
+      modalController.removeListener(syncToMain);
+      // Defer disposal to the next frame so the modal route's widget tree
+      // is fully deactivated first. Disposing here would race with
+      // ExpandedTextEditorSheet.dispose() which still needs the controller,
+      // and can trigger _dependents.isEmpty assertion failures when
+      // MediaQuery-dependent widgets rebuild during deactivation.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        modalController.dispose();
+      });
+      if (mounted) setState(() => _expandModalOpen = false);
+      if (shouldSend == true && mounted) _sendMessage();
+    });
+  }
+
+  // --- Inline Voice Input ---
+  Future<void> _toggleVoice() async {
+    if (_isRecording) {
+      await _stopVoice();
+    } else {
+      await _startVoice();
+    }
+  }
+
+  Future<void> _startVoice() async {
+    if (!widget.enabled || _startingVoice) return;
+    _startingVoice = true;
+    final generation = ++_voiceStartGeneration;
+    final origin = ref.read(composerDraftContextProvider);
+    final baseSnapshot = _controller.snapshotDraft();
+    final baseText = _controller.text;
+    try {
+      await _recordingSession?.close();
+      final ok = await _voiceInputService.initialize();
+      if (!mounted || generation != _voiceStartGeneration) return;
+      if (!ok) {
+        _showVoiceUnavailable(
+          AppLocalizations.of(context)?.errorMessage ??
+              'Voice input unavailable',
+        );
+        return;
+      }
+      var expectedSnapshot = baseSnapshot;
+      late final ComposerRecordingSession recording;
+      recording = await ComposerRecordingSession.begin(
+        origin,
+        stop: (session) => _stopVoiceListening(recording: session),
+        onSaveFailure: () => _showRecordingSaveFailure(recording),
+      );
+      _recordingSession = recording;
+      if (!mounted || generation != _voiceStartGeneration) {
+        await recording.close();
+        return;
+      }
+      // Centralized permission + start
+      final stream = await _voiceInputService.beginListening(
+        recording: recording.sink,
+      );
+      if (!mounted || generation != _voiceStartGeneration) {
+        await _voiceInputService.stopListening();
+        await recording.close();
+        return;
+      }
+      _transcribingListenable?.removeListener(_handleTranscribingChanged);
+      _transcribingListenable = _voiceInputService.transcribing
+        ..addListener(_handleTranscribingChanged);
+      setState(() {
+        _isRecording = true;
+        _recordingTranscriptionErrorId = null;
+        _recordingCaptureErrorId = null;
+      });
+      _textSub?.cancel();
+      _textSub = stream
+          .asyncMap<void>((text) async {
+            final updated = baseText.isEmpty
+                ? text
+                : '${baseText.trimRight()} $text';
+            final copy = MentionTextEditingController();
+            copy.restoreDraft(baseSnapshot);
+            copy.value = TextEditingValue(
+              text: updated,
+              selection: TextSelection.collapsed(offset: updated.length),
+            );
+            final nextSnapshot = copy.snapshotDraft();
+            copy.dispose();
+            if (await _draftBinding?.applyDictation(
+                  origin,
+                  expectedSnapshot,
+                  nextSnapshot,
+                ) ==
+                true) {
+              expectedSnapshot = nextSnapshot;
+            }
+          })
+          .listen(
+            (_) {},
+            onDone: () {
+              unawaited(recording.close().catchError((Object _) {}));
+              if (!mounted) return;
+              setState(() => _isRecording = false);
+            },
+            onError: (Object error) async {
+              await recording.stopped;
+              if (!mounted) return;
+              final saved = (recording.writer?.savedBytes ?? 0) > 0;
+              setState(() {
+                _isRecording = false;
+                if (saved) {
+                  if (error is NativeSttException &&
+                      error.code == 'AUDIO_PRESERVATION_FAILED') {
+                    _recordingCaptureErrorId = recording.id;
+                  } else {
+                    _recordingTranscriptionErrorId = recording.id;
+                  }
+                }
+              });
+              if (!saved) {
+                _showVoiceUnavailable(
+                  AppLocalizations.of(context)!.errorMessage,
+                );
+              }
+            },
+          );
+      _ensureFocusedIfEnabled();
+      if (!origin.temporary && !_voiceInputService.recordingRecoverySupported) {
+        unawaited(
+          origin.store?.recordings
+              .discard(recording.id)
+              .catchError((Object _) {}),
+        );
+        _showVoiceUnavailable(
+          AppLocalizations.of(context)!.recordingRecoveryUnavailable,
+        );
+      }
+    } catch (_) {
+      await _recordingSession?.close().catchError((Object _) {});
+      if (!mounted) return;
+      _showVoiceUnavailable(
+        AppLocalizations.of(context)?.errorMessage ??
+            'Failed to start voice input',
+      );
+      setState(() => _isRecording = false);
+    } finally {
+      _startingVoice = false;
+    }
+  }
+
+  void _showRecordingSaveFailure(ComposerRecordingSession recording) {
+    if (!mounted || _isDeactivated) return;
+    final l10n = AppLocalizations.of(context)!;
+    AdaptiveSnackBar.show(
+      context,
+      message: l10n.recordingSaveFailed,
+      type: AdaptiveSnackBarType.error,
+      action: l10n.retry,
+      onActionPressed: () =>
+          unawaited(recording.flush().catchError((Object _) {})),
+    );
+  }
+
+  void _handleTranscribingChanged() {
+    final value = _transcribingListenable?.value ?? false;
+    if (!mounted || value == _isTranscribing) return;
+    setState(() => _isTranscribing = value);
+  }
+
+  Future<void> _stopVoiceListening({
+    ComposerRecordingSession? recording,
+  }) async {
+    ++_voiceStartGeneration;
+    final session = recording ?? _recordingSession;
+    try {
+      await _voiceInputService.stopListening();
+    } finally {
+      await session?.close().catchError((Object _) {});
+      if (mounted) {
+        setState(() {
+          _isTranscribing = false;
+          _isRecording = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _stopVoice() async {
+    await _stopVoiceListening();
+    if (!mounted) return;
+    ConduitHaptics.selectionClick();
+  }
+
+  // When on-device STT is unavailable we rely on server transcription.
+
+  void _showVoiceUnavailable(String message) {
+    if (!mounted) return;
+    AdaptiveSnackBar.show(
+      context,
+      message: message,
+      type: AdaptiveSnackBarType.warning,
+      duration: const Duration(seconds: 2),
+    );
+  }
+
+  Future<void> _createNoteFromDraft() async {
+    if (!widget.enabled) {
+      return;
+    }
+
+    final draftText = _controller.text;
+    if (draftText.trim().isEmpty) {
+      return;
+    }
+
+    ConduitHaptics.lightImpact();
+
+    final title = DateFormat('yyyy-MM-dd').format(DateTime.now());
+    final note = await ref
+        .read(noteCreatorProvider.notifier)
+        .createNote(title: title, markdownContent: draftText);
+
+    if (!mounted || _isDeactivated) {
+      return;
+    }
+
+    if (note == null) {
+      ConduitHaptics.error();
+      AdaptiveSnackBar.show(
+        context,
+        message: AppLocalizations.of(context)!.errorMessage,
+        type: AdaptiveSnackBarType.error,
+        duration: const Duration(seconds: 2),
+      );
+      return;
+    }
+
+    _controller.clearMentions();
+    _controller.clear();
+    _hidePromptOverlay();
+    ConduitHaptics.success();
+    NavigationService.router.go('/notes/${note.id}');
+  }
+}
+
+/// conduit_core's suggestion kinds (composer_commands.dart).
+typedef _ComposerContextSuggestionType = ComposerContextSuggestionType;
+
+/// A core [ComposerContextSuggestion] with the icon this composer draws.
+class _ComposerContextSuggestion {
+  const _ComposerContextSuggestion({
+    required this.type,
+    required this.id,
+    required this.displayName,
+    required this.icon,
+    this.subtitle,
+    this.collectionName,
+    this.source,
+  });
+
+  final _ComposerContextSuggestionType type;
+  final String id;
+  final String displayName;
+  final String? subtitle;
+  final String? collectionName;
+  final String? source;
+  final IconData icon;
+}
+
+class _ContextSuggestionPlaceholder extends StatelessWidget {
+  const _ContextSuggestionPlaceholder({required this.leading});
+
+  final Widget leading;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(
+        horizontal: Spacing.sm,
+        vertical: Spacing.md,
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [leading],
+      ),
+    );
+  }
+}

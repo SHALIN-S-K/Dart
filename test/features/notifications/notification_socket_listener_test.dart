@@ -1,0 +1,595 @@
+import 'dart:async';
+
+import 'package:checks/checks.dart';
+import 'package:conduit_core/auth/api_auth_interceptor.dart';
+import 'package:conduit_core/models/channel.dart';
+import 'package:conduit_core/models/server_config.dart';
+import 'package:conduit_core/models/user.dart';
+import 'package:conduit_core/providers/app_providers.dart';
+import 'package:conduit_core/services/api_service.dart';
+import 'package:conduit_core/services/settings_service.dart';
+import 'package:conduit_core/services/socket_service.dart';
+import 'package:conduit_core/services/worker_manager.dart';
+import 'package:conduit_core/features/channels/providers/channel_providers.dart';
+import 'package:conduit_core/features/notifications/models/app_notification.dart';
+import 'package:conduit/features/notifications/providers/notification_socket_listener.dart';
+import 'package:conduit_core/features/notifications/services/active_view_tracker.dart';
+import 'package:conduit/features/notifications/services/local_notification_service.dart';
+import 'package:conduit/features/notifications/services/notification_router.dart';
+import 'package:conduit/features/notifications/services/notification_sound_service.dart';
+import 'package:conduit/features/navigation/providers/chat_back_provider.dart';
+import 'package:conduit/shared/services/navigation_service.dart';
+import 'package:conduit_core/database/app_database.dart';
+import 'package:conduit_core/database/local_conversation_loader.dart';
+import 'package:conduit_core/features/auth/providers/unified_auth_providers.dart';
+import 'package:conduit_core/sync/chat_locks.dart';
+import 'package:conduit_core/sync/pull_sync.dart';
+import 'package:conduit_core/testing.dart';
+import 'package:drift/native.dart';
+import 'package:go_router/go_router.dart';
+import 'package:material_ui/material_ui.dart' show SizedBox;
+import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+class _CapturedChat {
+  _CapturedChat({required this.requireFocus, required this.handler});
+  final bool requireFocus;
+  final SocketChatEventHandler handler;
+}
+
+class _CapturedChannel {
+  _CapturedChannel({required this.requireFocus, required this.handler});
+  final bool requireFocus;
+  final SocketChannelEventHandler handler;
+}
+
+/// SocketService stand-in that records the wildcard chat/channel handlers the
+/// listener registers and lets the test drive them + pump reconnect.
+class _MockSocketService implements SocketService {
+  final List<_CapturedChat> chat = <_CapturedChat>[];
+  final List<_CapturedChannel> channel = <_CapturedChannel>[];
+  final _reconnect = StreamController<void>.broadcast();
+
+  void emitReconnect() => _reconnect.add(null);
+  void disposeController() => _reconnect.close();
+
+  @override
+  SocketEventSubscription addChatEventHandler({
+    String? conversationId,
+    String? sessionId,
+    String? messageId,
+    bool requireFocus = true,
+    bool keepsAliveInBackground = false,
+    SocketReplayGapCallback? onReplayGap,
+    required SocketChatEventHandler handler,
+  }) {
+    final reg = _CapturedChat(requireFocus: requireFocus, handler: handler);
+    chat.add(reg);
+    return SocketEventSubscription(() => chat.remove(reg));
+  }
+
+  @override
+  SocketEventSubscription addChannelEventHandler({
+    String? conversationId,
+    String? sessionId,
+    bool requireFocus = true,
+    required SocketChannelEventHandler handler,
+  }) {
+    final reg = _CapturedChannel(requireFocus: requireFocus, handler: handler);
+    channel.add(reg);
+    return SocketEventSubscription(() => channel.remove(reg));
+  }
+
+  @override
+  Stream<void> get onReconnect => _reconnect.stream;
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => null;
+}
+
+/// Channels list whose `refresh` is counted (reconnect reconciliation).
+/// Delivers notification taps without the platform plugin.
+class _TapSource extends LocalNotificationService {
+  final StreamController<NotificationTap> _taps =
+      StreamController<NotificationTap>.broadcast();
+
+  @override
+  Stream<NotificationTap> get taps => _taps.stream;
+
+  @override
+  Future<void> initialize() async {}
+
+  void tap(NotificationTap tap) => _taps.add(tap);
+}
+
+class _FakeChannelsList extends ChannelsList {
+  _FakeChannelsList([
+    this.initial = const [Channel(id: 'chan-1', name: 'general')],
+  ]);
+
+  final List<Channel> initial;
+  int refreshCalls = 0;
+
+  @override
+  Future<List<Channel>> build() async => initial;
+
+  @override
+  Future<void> refresh() async {
+    refreshCalls += 1;
+  }
+}
+
+class _ReconnectChannelApi extends ApiService {
+  _ReconnectChannelApi()
+    : super(
+        serverConfig: const ServerConfig(
+          id: 'server',
+          name: 'Server',
+          url: 'https://example.test',
+        ),
+        workerManager: WorkerManager(),
+      );
+
+  String messageId = 'before-reconnect';
+  int messageRequests = 0;
+
+  @override
+  Future<List<Map<String, dynamic>>> getChannelMessages(
+    String channelId, {
+    int skip = 0,
+    int limit = 50,
+  }) async {
+    messageRequests += 1;
+    return <Map<String, dynamic>>[
+      <String, dynamic>{'id': messageId, 'content': messageId},
+    ];
+  }
+}
+
+/// An API that answers the details of a channel the list does not hold.
+class _ChannelLookupApi extends ApiService {
+  _ChannelLookupApi(this.channel)
+    : super(
+        serverConfig: const ServerConfig(
+          id: 'server',
+          name: 'Server',
+          url: 'https://example.test',
+        ),
+        workerManager: WorkerManager(),
+      );
+
+  final Map<String, dynamic> channel;
+  final List<String> reads = [];
+
+  @override
+  Future<Map<String, dynamic>> getChannel(
+    String channelId, {
+    ApiAuthSnapshot? authSnapshot,
+  }) async {
+    reads.add(channelId);
+    return channel;
+  }
+}
+
+Map<String, dynamic> _chatCompletion({
+  String chatId = 'chat-1',
+  bool done = true,
+  String type = 'chat:completion',
+}) => {
+  'chat_id': chatId,
+  'data': {
+    'type': type,
+    'data': {'done': done, 'content': 'hello', 'title': 'Greeting'},
+  },
+};
+
+Map<String, dynamic> _channelMessage({
+  String channelId = 'chan-1',
+  String type = 'message',
+  String content = 'hi',
+}) => {
+  'channel_id': channelId,
+  'channel': {'type': 'group', 'name': 'general'},
+  'data': {
+    'type': type,
+    'data': {
+      'id': 'm1',
+      'content': content,
+      'user': {'id': 'other', 'name': 'Ada'},
+    },
+  },
+};
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  const settings = AppSettings(
+    notificationsEnabled: true,
+    notificationSound: false,
+    notificationSoundAlways: false,
+    notificationInAppBanner: true,
+    notificationSystem: true,
+    notificationChatEnabled: true,
+    notificationChannelEnabled: true,
+  );
+
+  late List<AppNotification> routed;
+  late List<AppNotification> unreads;
+
+  ProviderContainer makeContainer(
+    _MockSocketService socket, {
+    ApiService? api,
+    List<Channel> channels = const [Channel(id: 'chan-1', name: 'general')],
+  }) {
+    routed = <AppNotification>[];
+    unreads = <AppNotification>[];
+    final captureRouter = NotificationRouter(
+      readSettings: () => settings,
+      readActiveView: () => const ActiveView(),
+      isAppForeground: () => true,
+      localNotifications: LocalNotificationService(),
+      sound: const NotificationSoundService(),
+      showInAppBanner: routed.add,
+      onChannelUnread: unreads.add,
+    );
+    final container = ProviderContainer(
+      overrides: [
+        socketServiceProvider.overrideWithValue(socket),
+        notificationRouterProvider.overrideWithValue(captureRouter),
+        channelsListProvider.overrideWith(() => _FakeChannelsList(channels)),
+        if (api != null) apiServiceProvider.overrideWithValue(api),
+        currentUserProvider.overrideWith(
+          (ref) async => const User(
+            id: 'me',
+            username: 'me',
+            email: 'me@example.com',
+            role: 'user',
+          ),
+        ),
+      ],
+    );
+    addTearDown(container.dispose);
+    return container;
+  }
+
+  group('a tapped chat notification (#852)', () {
+    late ProviderContainer container;
+    late _TapSource taps;
+
+    setUp(() async {
+      final db = AppDatabase(NativeDatabase.memory());
+      addTearDown(db.close);
+      final server = FakeOpenWebUiServer()
+        ..seedChat(
+          id: 'chat-1',
+          blob: {
+            'title': 'Greeting',
+            'history': {
+              'messages': {
+                'm1': {
+                  'id': 'm1',
+                  'parentId': null,
+                  'childrenIds': <String>[],
+                  'role': 'user',
+                  'content': 'hello',
+                  'timestamp': 100,
+                },
+              },
+              'currentId': 'm1',
+            },
+          },
+          createdAt: 100,
+          updatedAt: 100,
+        );
+      final pull = PullSync(
+        client: FakeSyncApiClient(server),
+        db: db,
+        locks: ConversationLocks(),
+      );
+      check((await pull.run()).success).isTrue();
+
+      taps = _TapSource();
+      container = ProviderContainer(
+        overrides: [
+          ...openWebUiStorageOpenOverrides(database: db),
+          isAuthenticatedProvider2.overrideWithValue(true),
+          reviewerModeProvider.overrideWithValue(false),
+          apiServiceProvider.overrideWithValue(null),
+          socketServiceProvider.overrideWithValue(null),
+          localNotificationServiceProvider.overrideWithValue(taps),
+        ],
+      );
+      addTearDown(container.dispose);
+      container.read(notificationSocketListenerProvider);
+    });
+
+    void attachRouterAt(String location) {
+      final router = GoRouter(
+        initialLocation: location,
+        routes: [
+          GoRoute(path: '/chat', builder: (_, _) => const SizedBox()),
+          GoRoute(path: '/channel/:id', builder: (_, _) => const SizedBox()),
+        ],
+      );
+      addTearDown(router.dispose);
+      NavigationService.attachRouter(router);
+    }
+
+    Future<void> tapChat(bool Function() done) async {
+      taps.tap(
+        const NotificationTap(
+          kind: NotificationKind.chatCompletion,
+          sourceId: 'chat-1',
+        ),
+      );
+      for (var i = 0; i < 200 && !done(); i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+    }
+
+    test('makes back open the chat list', () async {
+      attachRouterAt('/channel/general');
+      check(container.read(chatBackOpensListProvider)).isFalse();
+
+      await tapChat(() => container.read(activeConversationProvider) != null);
+
+      check(NavigationService.currentRoute).equals('/chat');
+      check(container.read(activeConversationProvider)?.id).equals('chat-1');
+      check(container.read(chatBackOpensListProvider)).isTrue();
+    });
+
+    test('for the active chat, tapped on a channel, does too', () async {
+      attachRouterAt('/channel/general');
+      final active = await loadLocalConversation(container, 'chat-1');
+      container.read(activeConversationProvider.notifier).set(active);
+
+      // The tap goes to the chat page before it opens the chat, so whether
+      // the chat was on screen is read first.
+      await tapChat(() => container.read(chatBackOpensListProvider));
+
+      check(NavigationService.currentRoute).equals('/chat');
+      check(container.read(chatBackOpensListProvider)).isTrue();
+    });
+  });
+
+  test('registers one wildcard chat + channel handler, requireFocus:false', () {
+    final socket = _MockSocketService();
+    addTearDown(socket.disposeController);
+    final container = makeContainer(socket);
+
+    container.read(notificationSocketListenerProvider);
+
+    check(socket.chat).length.equals(1);
+    check(socket.channel).length.equals(1);
+    check(socket.chat.single.requireFocus).isFalse();
+    check(socket.channel.single.requireFocus).isFalse();
+  });
+
+  test('routes a notifiable chat completion', () async {
+    final socket = _MockSocketService();
+    addTearDown(socket.disposeController);
+    final container = makeContainer(socket);
+    container.read(notificationSocketListenerProvider);
+
+    socket.chat.single.handler(_chatCompletion(), null);
+    await Future<void>.delayed(Duration.zero);
+
+    check(routed).length.equals(1);
+    check(routed.single.kind).equals(NotificationKind.chatCompletion);
+  });
+
+  test('ignores a non-terminal completion frame', () async {
+    final socket = _MockSocketService();
+    addTearDown(socket.disposeController);
+    final container = makeContainer(socket);
+    container.read(notificationSocketListenerProvider);
+
+    socket.chat.single.handler(_chatCompletion(done: false), null);
+    await Future<void>.delayed(Duration.zero);
+
+    check(routed).isEmpty();
+  });
+
+  test('ignores a non-notifiable chat type', () async {
+    final socket = _MockSocketService();
+    addTearDown(socket.disposeController);
+    final container = makeContainer(socket);
+    container.read(notificationSocketListenerProvider);
+
+    socket.chat.single.handler(_chatCompletion(type: 'chat:title'), null);
+    await Future<void>.delayed(Duration.zero);
+
+    check(routed).isEmpty();
+  });
+
+  test('routes a notifiable channel message', () async {
+    final socket = _MockSocketService();
+    addTearDown(socket.disposeController);
+    final container = makeContainer(socket);
+    container.read(notificationSocketListenerProvider);
+    await container.read(currentUserProvider.future); // resolve self id
+    await container.read(channelsListProvider.future);
+
+    socket.channel.single.handler(_channelMessage(), null);
+    await Future<void>.delayed(Duration.zero);
+
+    check(routed).length.equals(1);
+    check(routed.single.kind).equals(NotificationKind.channelMessage);
+  });
+
+  // Open WebUI 0.12.1 +layout.svelte with shouldNotifyChannelMessage.
+  group('a channel set to mentions only', () {
+    const muted = [
+      Channel(id: 'chan-1', name: 'general', isChannelMuted: true),
+    ];
+
+    Future<ProviderContainer> start(
+      _MockSocketService socket, {
+      ApiService? api,
+      List<Channel> channels = muted,
+    }) async {
+      final container = makeContainer(socket, api: api, channels: channels);
+      container.read(notificationSocketListenerProvider);
+      await container.read(currentUserProvider.future);
+      await container.read(channelsListProvider.future);
+      return container;
+    }
+
+    test('counts a message without a mention but does not alert', () async {
+      final socket = _MockSocketService();
+      addTearDown(socket.disposeController);
+      await start(socket);
+
+      socket.channel.single.handler(_channelMessage(), null);
+      await Future<void>.delayed(Duration.zero);
+
+      check(routed).isEmpty();
+      check(unreads).length.equals(1);
+    });
+
+    test('alerts for a message that mentions the user', () async {
+      final socket = _MockSocketService();
+      addTearDown(socket.disposeController);
+      await start(socket);
+
+      socket.channel.single.handler(
+        _channelMessage(content: 'ping <@U:me|Me>'),
+        null,
+      );
+      await Future<void>.delayed(Duration.zero);
+
+      check(routed).length.equals(1);
+    });
+
+    test('reads the setting of a channel the list does not hold', () async {
+      final socket = _MockSocketService();
+      addTearDown(socket.disposeController);
+      final api = _ChannelLookupApi({
+        'id': 'chan-2',
+        'name': 'new',
+        'is_channel_muted': true,
+      });
+      await start(socket, api: api, channels: const []);
+
+      socket.channel.single.handler(_channelMessage(channelId: 'chan-2'), null);
+      await Future<void>.delayed(Duration.zero);
+
+      check(api.reads).deepEquals(['chan-2']);
+      check(routed).isEmpty();
+    });
+
+    test('channel:mute updates the list for any channel', () async {
+      final socket = _MockSocketService();
+      addTearDown(socket.disposeController);
+      final container = await start(
+        socket,
+        channels: const [Channel(id: 'chan-1', name: 'general')],
+      );
+
+      socket.channel.single.handler({
+        'channel_id': 'chan-1',
+        'data': {
+          'type': 'channel:mute',
+          'data': {'is_channel_muted': true},
+        },
+      }, null);
+      await Future<void>.delayed(Duration.zero);
+
+      check(
+        container.read(channelsListProvider).value!.single.isChannelMuted,
+      ).isTrue();
+      check(routed).isEmpty();
+
+      socket.channel.single.handler(_channelMessage(), null);
+      await Future<void>.delayed(Duration.zero);
+      check(routed).isEmpty();
+    });
+  });
+
+  test(
+    'skips channel classification until the current user resolves',
+    () async {
+      final socket = _MockSocketService();
+      addTearDown(socket.disposeController);
+      final container = makeContainer(socket);
+      container.read(notificationSocketListenerProvider);
+
+      // Do NOT await currentUserProvider: id is still unresolved, so a channel
+      // message must be skipped rather than risk self-notifying.
+      socket.channel.single.handler(_channelMessage(), null);
+      await Future<void>.delayed(Duration.zero);
+
+      check(routed).isEmpty();
+    },
+  );
+
+  test('reconnect reconciles channel unread via refresh', () async {
+    final socket = _MockSocketService();
+    addTearDown(socket.disposeController);
+    final container = makeContainer(socket);
+    container.read(notificationSocketListenerProvider);
+
+    final channels =
+        container.read(channelsListProvider.notifier) as _FakeChannelsList;
+    final before = channels.refreshCalls;
+
+    socket.emitReconnect();
+    await Future<void>.delayed(Duration.zero);
+
+    check(channels.refreshCalls).equals(before + 1);
+  });
+
+  test('reconnect also reloads cached channel messages', () async {
+    final socket = _MockSocketService();
+    final api = _ReconnectChannelApi();
+    addTearDown(socket.disposeController);
+    final container = makeContainer(socket, api: api);
+    container.read(notificationSocketListenerProvider);
+    final messages = channelMessagesProvider('chan-1');
+    final messagesSubscription = container.listen(messages, (_, _) {});
+    addTearDown(messagesSubscription.close);
+    final initial = await container.read(messages.future);
+    check(initial.single.id).equals('before-reconnect');
+
+    api.messageId = 'after-reconnect';
+    socket.emitReconnect();
+    await Future<void>.delayed(Duration.zero);
+    final refreshed = await container.read(messages.future);
+
+    check(refreshed.single.id).equals('after-reconnect');
+    check(api.messageRequests).equals(2);
+  });
+
+  test('re-binds handlers when the socket instance changes', () {
+    final socket1 = _MockSocketService();
+    final socket2 = _MockSocketService();
+    addTearDown(socket1.disposeController);
+    addTearDown(socket2.disposeController);
+    final container = makeContainer(socket1);
+
+    container.read(notificationSocketListenerProvider);
+    check(socket1.chat).length.equals(1);
+
+    container.updateOverrides([
+      socketServiceProvider.overrideWithValue(socket2),
+      notificationRouterProvider.overrideWithValue(
+        container.read(notificationRouterProvider),
+      ),
+      channelsListProvider.overrideWith(_FakeChannelsList.new),
+      currentUserProvider.overrideWith(
+        (ref) async => const User(
+          id: 'me',
+          username: 'me',
+          email: 'me@example.com',
+          role: 'user',
+        ),
+      ),
+    ]);
+
+    // Old subscriptions disposed, fresh ones registered on the new socket.
+    check(socket1.chat).isEmpty();
+    check(socket1.channel).isEmpty();
+    check(socket2.chat).length.equals(1);
+    check(socket2.channel).length.equals(1);
+  });
+}

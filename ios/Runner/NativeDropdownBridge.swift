@@ -1,0 +1,449 @@
+import Flutter
+import UIKit
+
+private func dropdownLocalized(_ key: String, _ fallback: String) -> String {
+    NSLocalizedString(key, tableName: nil, bundle: .main, value: fallback, comment: "")
+}
+
+/// Symbol the Dart layer sends for the currently selected option.
+private let nativeDropdownSelectionSymbol = "checkmark"
+
+/// Glyph used when an option's symbol cannot be rendered inline. It mirrors the
+/// selected-row marker the other native action sheets already use.
+private let nativeDropdownCheckmarkGlyph = "✓"
+
+final class NativeDropdownCompletion: NSObject, UIAdaptivePresentationControllerDelegate {
+    private var completion: ((Result<String?, Error>) -> Void)?
+
+    init(_ completion: @escaping (Result<String?, Error>) -> Void) {
+        self.completion = completion
+    }
+
+    func finish(_ result: Result<String?, Error>) {
+        guard let completion else { return }
+        self.completion = nil
+        completion(result)
+    }
+
+    func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+        finish(.success(nil))
+    }
+}
+
+private var nativeDropdownCompletionKey: UInt8 = 0
+
+private struct NativeDropdownOption {
+    let id: String
+    let label: String
+    let subtitle: String?
+    let sfSymbol: String?
+    let enabled: Bool
+    let destructive: Bool
+
+    init(_ option: PlatformDropdownOption) {
+        id = option.id
+        label = option.label
+        subtitle = option.subtitle
+        sfSymbol = option.sfSymbol
+        enabled = option.enabled
+        destructive = option.destructive
+    }
+
+    init?(_ payload: [String: Any]) {
+        guard
+            let id = payload["id"] as? String,
+            !id.isEmpty,
+            let label = payload["label"] as? String,
+            !label.isEmpty
+        else {
+            return nil
+        }
+
+        self.id = id
+        self.label = label
+        subtitle = payload["subtitle"] as? String
+        sfSymbol = payload["sfSymbol"] as? String
+        enabled = payload["enabled"] as? Bool ?? true
+        destructive = payload["destructive"] as? Bool ?? false
+    }
+}
+
+/// `UIAlertAction` has no public image API, so an option's symbol cannot be
+/// drawn inside the action. The selection marker still has to survive, so it
+/// moves into the title.
+private func decoratedDropdownLabel(_ option: NativeDropdownOption) -> String {
+    guard option.sfSymbol == nativeDropdownSelectionSymbol else {
+        return option.label
+    }
+    return "\(nativeDropdownCheckmarkGlyph) \(option.label)"
+}
+
+private struct NativeDropdownConfiguration {
+    let title: String?
+    let message: String?
+    let cancelLabel: String
+    let options: [NativeDropdownOption]
+    let sourceRect: CGRect?
+
+    init?(_ request: PlatformDropdownRequest) {
+        options = request.options.map(NativeDropdownOption.init)
+        guard !options.isEmpty else {
+            return nil
+        }
+        title = request.title
+        message = request.message
+        cancelLabel = request.cancelLabel
+            ?? dropdownLocalized("native.cancel", "Cancel")
+        if let rect = request.sourceRect {
+            sourceRect = CGRect(
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height
+            )
+        } else {
+            sourceRect = nil
+        }
+    }
+
+    init?(_ arguments: Any?) {
+        guard let payload = arguments as? [String: Any] else {
+            return nil
+        }
+
+        let rawOptions = payload["options"] as? [[String: Any]] ?? []
+        options = rawOptions.compactMap(NativeDropdownOption.init)
+        guard !options.isEmpty else {
+            return nil
+        }
+
+        title = payload["title"] as? String
+        message = payload["message"] as? String
+        cancelLabel = (payload["cancelLabel"] as? String) ?? dropdownLocalized("native.cancel", "Cancel")
+
+        if let rect = payload["sourceRect"] as? [String: Any],
+           let x = rect["x"] as? NSNumber,
+           let y = rect["y"] as? NSNumber,
+           let width = rect["width"] as? NSNumber,
+           let height = rect["height"] as? NSNumber {
+            sourceRect = CGRect(
+                x: x.doubleValue,
+                y: y.doubleValue,
+                width: width.doubleValue,
+                height: height.doubleValue
+            )
+        } else {
+            sourceRect = nil
+        }
+    }
+}
+
+/// Presents simple option lists with native UIKit menus/action sheets.
+final class NativeDropdownBridge: ConduitBridge, NativeDropdownHostApi {
+    static let shared = NativeDropdownBridge()
+
+    private var host: ConduitBridgeHost?
+    private let contextMenu = NativeMessageContextMenuPresenter()
+
+    private init() {}
+
+    func attach(to host: ConduitBridgeHost) {
+        contextMenu.detach()
+        self.host = host
+        NativeDropdownHostApiSetup.setUp(binaryMessenger: host.messenger, api: self)
+    }
+
+    /// Installs on an available host view on iOS 26 or newer; otherwise returns false.
+    func initializeContextMenu() throws -> Bool {
+        guard #available(iOS 26.0, *),
+              let view = host?.presentingViewController?.view else { return false }
+        contextMenu.install(on: view)
+        return true
+    }
+
+    /// Rejects invalid configuration or preview bytes with PRESENTATION_FAILED.
+    func showContextMenu(
+        requestId: Int64,
+        request: PlatformDropdownRequest,
+        previewPng: FlutterStandardTypedData,
+        completion: @escaping (Result<String?, Error>) -> Void
+    ) {
+        guard let configuration = NativeDropdownConfiguration(request),
+              let image = UIImage(data: previewPng.data) else {
+            completion(.failure(PigeonError(
+                code: "PRESENTATION_FAILED",
+                message: dropdownLocalized("native.unablePresentDropdown", "Unable to present native dropdown"),
+                details: nil
+            )))
+            return
+        }
+        contextMenu.show(requestId, configuration, image, completion)
+    }
+
+    func cancelContextMenu(requestId: Int64) throws {
+        contextMenu.cancel(requestId)
+    }
+
+    func show(
+        request: PlatformDropdownRequest,
+        completion: @escaping (Result<String?, Error>) -> Void
+    ) {
+        DispatchQueue.main.async { [weak self] in
+            guard let configuration = NativeDropdownConfiguration(request)
+            else {
+                completion(.failure(PigeonError(
+                    code: "INVALID_ARGS",
+                    message: dropdownLocalized("native.missingDropdownOptions", "Missing dropdown options"),
+                    details: nil
+                )))
+                return
+            }
+            self?.show(configuration, completion: completion)
+        }
+    }
+
+    private func show(
+        _ configuration: NativeDropdownConfiguration,
+        completion: @escaping (Result<String?, Error>) -> Void
+    ) {
+        guard let presenter = topViewController() else {
+            completion(.failure(PigeonError(
+                code: "PRESENTATION_FAILED",
+                message: dropdownLocalized("native.unablePresentDropdown", "Unable to present native dropdown"),
+                details: nil
+            )))
+            return
+        }
+
+        let controller = UIAlertController(
+            title: configuration.title,
+            message: configuration.message,
+            preferredStyle: .actionSheet
+        )
+        let result = NativeDropdownCompletion(completion)
+        objc_setAssociatedObject(
+            controller,
+            &nativeDropdownCompletionKey,
+            result,
+            .OBJC_ASSOCIATION_RETAIN_NONATOMIC
+        )
+
+        configuration.options.forEach { option in
+            let style: UIAlertAction.Style = option.destructive
+                ? .destructive
+                : .default
+            let action = UIAlertAction(
+                title: decoratedDropdownLabel(option),
+                style: style
+            ) { _ in
+                result.finish(.success(option.id))
+            }
+            action.isEnabled = option.enabled
+            controller.addAction(action)
+        }
+
+        controller.addAction(
+            UIAlertAction(title: configuration.cancelLabel, style: .cancel) { _ in
+                result.finish(.success(nil))
+            }
+        )
+
+        NativeSheetTheme.shared.apply(to: controller)
+
+        if let popover = controller.popoverPresentationController {
+            popover.sourceView = presenter.view
+            if let sourceRect = configuration.sourceRect {
+                popover.sourceRect = presenter.view.convert(sourceRect, from: nil)
+            } else {
+                popover.sourceRect = CGRect(
+                    x: presenter.view.bounds.midX,
+                    y: presenter.view.bounds.midY,
+                    width: 1,
+                    height: 1
+                )
+            }
+            popover.permittedArrowDirections = [.up, .down]
+        }
+
+        presenter.present(controller, animated: true)
+        if controller.presentingViewController == nil {
+            result.finish(.failure(PigeonError(
+                code: "PRESENTATION_FAILED",
+                message: dropdownLocalized("native.unablePresentDropdown", "Unable to present native dropdown"),
+                details: nil
+            )))
+            return
+        }
+
+        // Both of these need the presentation to exist. Reading them earlier
+        // builds a presentation controller outside the presenting trait
+        // environment and loads the alert's private view ahead of UIKit.
+        controller.presentationController?.delegate = result
+        NativeSheetTheme.shared.applyAccent(to: controller)
+    }
+
+    private func topViewController() -> UIViewController? {
+        topViewController(from: host?.presentingViewController)
+    }
+
+    private func topViewController(from root: UIViewController?) -> UIViewController? {
+        if let navigation = root as? UINavigationController {
+            return topViewController(from: navigation.visibleViewController)
+        }
+        if let tab = root as? UITabBarController {
+            return topViewController(from: tab.selectedViewController)
+        }
+        if let presented = root?.presentedViewController {
+            return topViewController(from: presented)
+        }
+        return root
+    }
+}
+
+/// Flutter recognizes the long press; a noninteractive UIControl presents
+/// UIKit's menu through its public primary-action API. The Flutter bubble stays
+/// in place with its original layout throughout the interaction.
+private final class NativeMessageContextMenuPresenter: UIControl {
+    private weak var sourceView: UIView?
+    private var requestId: Int64?
+    private var configuration: NativeDropdownConfiguration?
+    private var completion: NativeDropdownCompletion?
+    private var selectedId: String?
+    private var showing = false
+    private let previewImage = UIImageView()
+
+    /// Reuses the same host; changing hosts first dismisses and completes the old request.
+    func install(on view: UIView) {
+        guard sourceView !== view else { return }
+        detach()
+        sourceView = view
+        view.addSubview(self)
+        addSubview(previewImage)
+        isContextMenuInteractionEnabled = true
+        showsMenuAsPrimaryAction = true
+        isUserInteractionEnabled = false
+        isAccessibilityElement = false
+        accessibilityElementsHidden = true
+    }
+
+    /// Dismisses, completes the pending request, and removes the presenter from its host.
+    func detach() {
+        contextMenuInteraction?.dismissMenu()
+        finish()
+        removeFromSuperview()
+        sourceView = nil
+    }
+
+    /// Presents a PNG at the global logical source rect on an attached, idle host.
+    /// Completes with an action ID or nil on dismissal; unavailable presentation fails.
+    func show(
+        _ requestId: Int64,
+        _ configuration: NativeDropdownConfiguration,
+        _ image: UIImage,
+        _ completion: @escaping (Result<String?, Error>) -> Void
+    ) {
+        guard !showing, sourceView?.window != nil,
+              let rect = configuration.sourceRect, !rect.isEmpty else {
+            completion(.failure(PigeonError(
+                code: "PRESENTATION_FAILED",
+                message: dropdownLocalized("native.unablePresentDropdown", "Unable to present native dropdown"),
+                details: nil
+            )))
+            return
+        }
+        finish()
+        self.requestId = requestId
+        self.configuration = configuration
+        self.completion = NativeDropdownCompletion(completion)
+        frame = sourceView?.convert(rect, from: nil) ?? .zero
+        previewImage.frame = bounds
+        previewImage.image = image
+        overrideUserInterfaceStyle = NativeSheetTheme.shared.isDark ? .dark : .light
+        if #available(iOS 17.4, *) {
+            performPrimaryAction()
+        } else {
+            finish()
+        }
+    }
+
+    /// Ignores other requests; a visible menu completes only after dismissal.
+    func cancel(_ requestId: Int64) {
+        guard self.requestId == requestId else { return }
+        if showing {
+            contextMenuInteraction?.dismissMenu()
+            return
+        }
+        finish()
+    }
+
+    /// Clears state before replying, and ignores completion from a superseded request.
+    private func finish(_ expectedId: Int64? = nil) {
+        if let expectedId, expectedId != requestId { return }
+        let completion = completion
+        let selectedId = selectedId
+        self.completion = nil
+        self.selectedId = nil
+        requestId = nil
+        configuration = nil
+        previewImage.image = nil
+        showing = false
+        completion?.finish(.success(selectedId))
+    }
+
+    override func contextMenuInteraction(
+        _ interaction: UIContextMenuInteraction,
+        previewForHighlightingMenuWithConfiguration configuration: UIContextMenuConfiguration
+    ) -> UITargetedPreview? {
+        guard let sourceView else { return nil }
+        let parameters = UIPreviewParameters()
+        parameters.backgroundColor = .clear
+        return UITargetedPreview(
+            view: previewImage,
+            parameters: parameters,
+            target: UIPreviewTarget(container: sourceView, center: center)
+        )
+    }
+
+    override func contextMenuInteraction(
+        _ interaction: UIContextMenuInteraction,
+        previewForDismissingMenuWithConfiguration configuration: UIContextMenuConfiguration
+    ) -> UITargetedPreview? {
+        contextMenuInteraction(interaction, previewForHighlightingMenuWithConfiguration: configuration)
+    }
+
+    override func contextMenuInteraction(
+        _ interaction: UIContextMenuInteraction,
+        configurationForMenuAtLocation location: CGPoint
+    ) -> UIContextMenuConfiguration? {
+        guard let configuration, let requestId else { return nil }
+        showing = true
+        return UIContextMenuConfiguration(identifier: NSNumber(value: requestId), previewProvider: nil) { [weak self] _ in
+            UIMenu(children: configuration.options.map { option in
+                var attributes: UIMenuElement.Attributes = []
+                if option.destructive { attributes.insert(.destructive) }
+                if !option.enabled { attributes.insert(.disabled) }
+                return UIAction(
+                    title: option.label,
+                    image: option.sfSymbol.flatMap(UIImage.init(systemName:)),
+                    attributes: attributes
+                ) { _ in
+                    if self?.requestId == requestId { self?.selectedId = option.id }
+                }
+            })
+        }
+    }
+
+    override func contextMenuInteraction(
+        _ interaction: UIContextMenuInteraction,
+        willEndFor configuration: UIContextMenuConfiguration,
+        animator: UIContextMenuInteractionAnimating?
+    ) {
+        super.contextMenuInteraction(interaction, willEndFor: configuration, animator: animator)
+        guard let id = configuration.identifier as? NSNumber else { return }
+        if let animator {
+            animator.addCompletion { [weak self] in self?.finish(id.int64Value) }
+        } else {
+            DispatchQueue.main.async { [weak self] in self?.finish(id.int64Value) }
+        }
+    }
+}

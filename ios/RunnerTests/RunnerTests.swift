@@ -1,0 +1,4526 @@
+import AVFoundation
+import Darwin
+import Flutter
+import ImageIO
+import UIKit
+import UniformTypeIdentifiers
+import XCTest
+@testable import Runner
+
+class RunnerTests: XCTestCase {
+  /// Verifies coordinate scaling and rejects malformed channel payloads.
+  func testTextMagnifierMapsFullViewCoordinates() throws {
+    let payload: [String: Any] = [
+      "viewWidth": 400.0, "viewHeight": 800.0,
+      "x": 120.0, "y": 500.0,
+      "caretX": 118.0, "caretY": 490.0,
+      "caretWidth": 2.0, "caretHeight": 20.0,
+    ]
+    let geometry = try XCTUnwrap(NativeTextMagnifierGeometry(
+      payload, in: CGRect(x: 10, y: 20, width: 200, height: 400)
+    ))
+    XCTAssertEqual(geometry.point, CGPoint(x: 70, y: 270))
+    XCTAssertEqual(geometry.caretRect, CGRect(x: 69, y: 265, width: 1, height: 10))
+    for (key, value) in [
+      ("viewWidth", 0.0), ("viewHeight", -1.0), ("x", Double.nan),
+      ("y", Double.infinity), ("caretWidth", -2.0), ("caretHeight", -1.0),
+    ] {
+      var invalid = payload
+      invalid[key] = value
+      XCTAssertNil(NativeTextMagnifierGeometry(invalid, in: CGRect(x: 0, y: 0, width: 400, height: 800)))
+    }
+    XCTAssertNil(NativeTextMagnifierGeometry([:], in: .zero))
+  }
+
+
+  /// Checks action delivery and exactly-once cancellation during app resignation.
+  @MainActor
+  func testNativeSelectionMenuKeepsChosenActionWhenAppResigns() throws {
+    guard #available(iOS 17.4, *) else { return }
+    let scene = try XCTUnwrap(
+      UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+    let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
+    let window = UIWindow(windowScene: scene)
+    window.frame = scene.coordinateSpace.bounds
+    let controller = UIViewController()
+    window.rootViewController = controller
+    window.makeKeyAndVisible()
+    window.layoutIfNeeded()
+    defer {
+      window.isHidden = true
+      previousKeyWindow?.makeKey()
+    }
+
+    for chosen in [0, 1, nil] {
+      let messenger = SelectionMenuTestMessenger()
+      let host = SelectionMenuTestHost(messenger: messenger, controller: controller)
+      let bridge = NativeTextSelectionMenuBridge()
+      bridge.attach(to: host)
+      let codec = FlutterStandardMethodCodec.sharedInstance()
+      var replies: [Int?] = []
+      let call = FlutterMethodCall(methodName: "show", arguments: [
+        "session": 1, "labels": ["Copy", "Ask Conduit"],
+        "rect": [20.0, 100.0, 160.0, 24.0],
+        "viewWidth": 390.0, "viewHeight": 844.0,
+      ])
+      let handler = try XCTUnwrap(messenger.handler)
+      handler(codec.encode(call)) { data in
+        guard let data else { XCTFail("Missing menu reply"); return }
+        replies.append((try? codec.decodeEnvelope(data)) as? Int)
+      }
+      let anchor = try XCTUnwrap(controller.view.subviews.last)
+      let interaction = try XCTUnwrap(anchor.interactions.first as? UIEditMenuInteraction)
+      let menu = try XCTUnwrap(bridge.editMenuInteraction(
+        interaction,
+        menuFor: UIEditMenuConfiguration(identifier: NSNumber(value: 1), sourcePoint: .zero),
+        suggestedActions: []))
+      if let chosen {
+        let action = try XCTUnwrap(menu.children[chosen] as? UIAction)
+        UIButton(primaryAction: action).performPrimaryAction()
+      }
+
+      // The app can resign after the action is chosen but before UIKit's
+      // dismissal animation completes. A second dismissal must not reply twice.
+      NotificationCenter.default.post(name: UIApplication.willResignActiveNotification, object: nil)
+      NotificationCenter.default.post(name: UIApplication.willResignActiveNotification, object: nil)
+      XCTAssertEqual(replies, [chosen])
+    }
+  }
+
+  /// Checks that host replacement isolates queued actions and animations.
+  @MainActor
+  func testNativeSelectionMenuIgnoresCallbacksFromPreviousHost() throws {
+    guard #available(iOS 17.4, *) else { return }
+    let scene = try XCTUnwrap(
+      UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+    let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
+    let window = UIWindow(windowScene: scene)
+    window.frame = scene.coordinateSpace.bounds
+    let controller = UIViewController()
+    window.rootViewController = controller
+    window.makeKeyAndVisible()
+    window.layoutIfNeeded()
+    defer {
+      window.isHidden = true
+      previousKeyWindow?.makeKey()
+    }
+    let codec = FlutterStandardMethodCodec.sharedInstance()
+    let call = codec.encode(FlutterMethodCall(methodName: "show", arguments: [
+      "session": 1, "labels": ["Copy"],
+      "rect": [20.0, 100.0, 160.0, 24.0],
+      "viewWidth": 390.0, "viewHeight": 844.0,
+    ]))
+    for staleAction in [true, false] {
+      let oldMessenger = SelectionMenuTestMessenger()
+      let oldHost = SelectionMenuTestHost(messenger: oldMessenger, controller: controller)
+      let bridge = NativeTextSelectionMenuBridge()
+      bridge.attach(to: oldHost)
+      try XCTUnwrap(oldMessenger.handler)(call) { _ in }
+      let anchor = try XCTUnwrap(controller.view.subviews.last)
+      let interaction = try XCTUnwrap(anchor.interactions.first as? UIEditMenuInteraction)
+      let configuration = UIEditMenuConfiguration(
+        identifier: NSNumber(value: 1), sourcePoint: .zero)
+      let menu = try XCTUnwrap(bridge.editMenuInteraction(
+        interaction, menuFor: configuration, suggestedActions: []))
+      let oldAction = try XCTUnwrap(menu.children.first as? UIAction)
+      let animator = SelectionMenuTestAnimator()
+      bridge.editMenuInteraction(
+        interaction, willDismissMenuFor: configuration, animator: animator)
+
+      let newMessenger = SelectionMenuTestMessenger()
+      let newHost = SelectionMenuTestHost(messenger: newMessenger, controller: controller)
+      bridge.attach(to: newHost)
+      var replies: [Int?] = []
+      // A new engine starts its session counter again.
+      try XCTUnwrap(newMessenger.handler)(call) { data in
+        guard let data else { XCTFail("Missing menu reply"); return }
+        replies.append((try? codec.decodeEnvelope(data)) as? Int)
+      }
+      if staleAction {
+        UIButton(primaryAction: oldAction).performPrimaryAction()
+      } else {
+        animator.completion?()
+        XCTAssertTrue(replies.isEmpty, "Old dismissal must not close the new menu")
+      }
+      NotificationCenter.default.post(name: UIApplication.willResignActiveNotification, object: nil)
+      XCTAssertEqual(replies, [nil], "Old actions must not act on the new menu")
+    }
+  }
+
+  /// Verifies a rejected replacement cannot leave a previous native menu open.
+  @MainActor
+  func testNativeSelectionMenuDismissesBeforeRejectingReplacement() throws {
+    guard #available(iOS 16.0, *) else { return }
+    let scene = try XCTUnwrap(
+      UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+    let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
+    let window = UIWindow(windowScene: scene)
+    window.frame = scene.coordinateSpace.bounds
+    let controller = UIViewController()
+    window.rootViewController = controller
+    window.makeKeyAndVisible()
+    window.layoutIfNeeded()
+    defer {
+      window.isHidden = true
+      previousKeyWindow?.makeKey()
+    }
+    let messenger = SelectionMenuTestMessenger()
+    let host = SelectionMenuTestHost(messenger: messenger, controller: controller)
+    let bridge = NativeTextSelectionMenuBridge()
+    bridge.attach(to: host)
+    let codec = FlutterStandardMethodCodec.sharedInstance()
+    let handler = try XCTUnwrap(messenger.handler)
+    var args: [String: Any] = [
+      "session": 1, "labels": ["Copy"],
+      "rect": [20.0, 100.0, 160.0, 24.0],
+      "viewWidth": 390.0, "viewHeight": 844.0,
+    ]
+    var oldReplies = 0
+    handler(codec.encode(FlutterMethodCall(methodName: "show", arguments: args))) { _ in
+      oldReplies += 1
+    }
+    let anchor = try XCTUnwrap(controller.view.subviews.last)
+    args["session"] = 2
+    args["labels"] = [String]()
+    var rejected = false
+    handler(codec.encode(FlutterMethodCall(methodName: "show", arguments: args))) { data in
+      rejected = data.map { codec.decodeEnvelope($0) is FlutterError } ?? false
+    }
+    XCTAssertTrue(rejected)
+    XCTAssertEqual(oldReplies, 1)
+    XCTAssertNil(anchor.superview)
+    NotificationCenter.default.post(name: UIApplication.willResignActiveNotification, object: nil)
+  }
+
+  func testAppDelegateConformsToCallKitCallbacksAtRuntime() {
+    // flutter_callkit_incoming reaches the callbacks with
+    // `UIApplication.shared.delegate as? CallkitIncomingAppDelegate`, a Swift
+    // protocol cast. The default implementations live in an extension of
+    // NativeSttCallKitAppDelegate, so the empty conformance on AppDelegate
+    // must still satisfy that cast.
+    let delegate: AnyObject = AppDelegate()
+    XCTAssertNotNil(delegate as? NativeSttCallKitAppDelegate)
+  }
+
+  func testPccSnapshotDeltaEmitsOnlyNewContent() throws {
+    XCTAssertEqual(
+      try pccSnapshotDelta(previous: "Hello", snapshot: "Hello world"),
+      " world"
+    )
+    XCTAssertEqual(
+      try pccSnapshotDelta(previous: "Hello world", snapshot: "Hello world"),
+      ""
+    )
+  }
+
+  func testPccSnapshotDeltaRejectsRewrites() {
+    XCTAssertThrowsError(
+      try pccSnapshotDelta(previous: "Hello", snapshot: "Goodbye")
+    )
+  }
+
+  func testPccDecodedImageBytesRejectsUnsafeAllocations() {
+    XCTAssertEqual(
+      pccDecodedImageBytes(width: 2_048, height: 2_048, currentBytes: 0),
+      16 * 1_024 * 1_024
+    )
+    XCTAssertNil(
+      pccDecodedImageBytes(width: 50_000, height: 50_000, currentBytes: 0)
+    )
+    XCTAssertNil(
+      pccDecodedImageBytes(width: 4_097, height: 4_097, currentBytes: 0)
+    )
+    XCTAssertNil(
+      pccDecodedImageBytes(
+        width: 2_048,
+        height: 2_048,
+        currentBytes: 60 * 1_024 * 1_024
+      )
+    )
+    XCTAssertEqual(
+      pccDecodedImageBytes(bytesPerRow: 8_192, height: 2_048, currentBytes: 0),
+      16 * 1_024 * 1_024
+    )
+    XCTAssertNil(
+      pccDecodedImageBytes(bytesPerRow: 32_769, height: 2_048, currentBytes: 0)
+    )
+    XCTAssertTrue(pccImageMetadataIsSafe(
+      depth: 8,
+      colorModel: kCGImagePropertyColorModelRGB as String
+    ))
+    XCTAssertFalse(pccImageMetadataIsSafe(
+      depth: 16,
+      colorModel: kCGImagePropertyColorModelRGB as String
+    ))
+    XCTAssertFalse(pccImageMetadataIsSafe(
+      depth: 8,
+      colorModel: kCGImagePropertyColorModelCMYK as String
+    ))
+  }
+
+#if canImport(FoundationModels)
+  func testPccGenerationOptionsValidateNativeBoundary() throws {
+    guard #available(iOS 26.0, *) else { return }
+    let request = PlatformPccCompletionRequest(
+      runId: "options",
+      model: .onDevice,
+      messages: [],
+      tools: [],
+      allowOnDeviceFallback: false,
+      temperature: 0.4,
+      maximumResponseTokens: 512,
+      topP: 0.9,
+      seed: 42
+    )
+    let options = try pccGenerationOptions(request)
+    XCTAssertEqual(options.temperature, 0.4)
+    XCTAssertEqual(options.maximumResponseTokens, 512)
+
+    let invalid = PlatformPccCompletionRequest(
+      runId: "invalid",
+      model: .onDevice,
+      messages: [],
+      tools: [],
+      allowOnDeviceFallback: false,
+      topP: 0.9,
+      topK: 40
+    )
+    XCTAssertThrowsError(try pccGenerationOptions(invalid))
+  }
+
+  func testPccStructuredSchemaAcceptsBoundedJsonObject() throws {
+    guard #available(iOS 26.0, *) else { return }
+    XCTAssertNoThrow(try pccGenerationSchema(
+      json: #"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}"#,
+      name: "Answer"
+    ))
+    XCTAssertThrowsError(try pccGenerationSchema(
+      json: #"{"type":"object","properties":{"value":{"type":"file"}}}"#,
+      name: "Unsupported"
+    ))
+    XCTAssertThrowsError(try pccGenerationSchema(
+      json: #"{"type":"object","properties":{},"required":["answer"]}"#,
+      name: "MissingRequiredProperty"
+    ))
+    XCTAssertThrowsError(try pccGenerationSchema(
+      json: #"{"type":"string","enum":[]}"#,
+      name: "EmptyEnum"
+    ))
+    // Numeric bounds occur in tool arguments as well as response schemas.
+    // In particular, web_search's optional max_results must retain its
+    // limits instead of causing the whole native tool to be skipped.
+    let boundedSearch = try pccGenerationSchema(
+      json: #"{"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer","minimum":1,"maximum":3}},"required":["query"]}"#,
+      name: "WebSearchArguments"
+    )
+    let encodedSearch = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: JSONEncoder().encode(boundedSearch)) as? [String: Any]
+    )
+    let properties = try XCTUnwrap(encodedSearch["properties"] as? [String: Any])
+    let maxResults = try XCTUnwrap(properties["max_results"] as? [String: Any])
+    XCTAssertEqual(maxResults["minimum"] as? Int, 1)
+    XCTAssertEqual(maxResults["maximum"] as? Int, 3)
+    XCTAssertEqual(encodedSearch["required"] as? [String], ["query"])
+
+    for json in [
+      #"{"type":"integer","minimum":-2}"#,
+      #"{"type":"integer","maximum":5}"#,
+      #"{"type":"integer","minimum":1,"maximum":1}"#,
+      #"{"type":"number","minimum":0.25,"maximum":0.75}"#,
+      #"{"type":"number","minimum":-0.5}"#,
+      #"{"type":"number","maximum":1}"#,
+    ] {
+      let schema = try pccGenerationSchema(json: json, name: "NumericBounds")
+      let expected = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+      )
+      let actual = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: JSONEncoder().encode(schema)) as? [String: Any]
+      )
+      for key in ["minimum", "maximum"] {
+        XCTAssertEqual(actual[key] as? NSNumber, expected[key] as? NSNumber, json)
+      }
+    }
+    for json in [
+      #"{"type":"integer","minimum":"1"}"#,
+      #"{"type":"integer","maximum":true}"#,
+      #"{"type":"integer","minimum":0.5}"#,
+      #"{"type":"integer","maximum":9223372036854775808}"#,
+      #"{"type":"integer","minimum":3,"maximum":1}"#,
+      #"{"type":"number","minimum":false}"#,
+      #"{"type":"number","maximum":"1"}"#,
+      #"{"type":"number","minimum":0.75,"maximum":0.25}"#,
+    ] {
+      XCTAssertThrowsError(try pccGenerationSchema(json: json, name: "InvalidBounds"), json)
+    }
+    XCTAssertThrowsError(try pccGenerationSchema(
+      json: #"{"type":[],"properties":{}}"#,
+      name: "EmptyTypeArray"
+    ))
+    XCTAssertThrowsError(try pccGenerationSchema(
+      json: #"{"type":["string","null"]}"#,
+      name: "NullableType"
+    ))
+    XCTAssertThrowsError(try pccGenerationSchema(
+      json: #"{"type":"array","items":{"type":"string"},"minItems":"2"}"#,
+      name: "StringArrayBound"
+    ))
+    XCTAssertThrowsError(try pccGenerationSchema(
+      json: #"{"type":"array","items":{"type":"string"},"minItems":true}"#,
+      name: "BooleanArrayBound"
+    ))
+    XCTAssertThrowsError(try pccGenerationSchema(
+      json: #"{"type":"array","items":{"type":"string"},"minItems":2,"maxItems":1}"#,
+      name: "ReversedArrayBounds"
+    ))
+  }
+#endif
+
+  func testNativeDropdownCompletionIsExactlyOnce() {
+    var selections: [String?] = []
+    let completion = NativeDropdownCompletion { result in
+      selections.append(try? result.get())
+    }
+
+    completion.finish(.success("selected"))
+    completion.finish(.success(nil))
+
+    XCTAssertEqual(selections.count, 1)
+    XCTAssertEqual(selections[0], "selected")
+  }
+
+  func testNativeSheetSegmentedControlUsesReadableThemeColors() throws {
+    NativeSheetTheme.shared.update(PlatformNativeSheetTheme(
+      isDark: true,
+      backgroundArgb: 0xFF000000,
+      surfaceArgb: 0xFF141414,
+      elevatedSurfaceArgb: 0xFF2C2C2E,
+      inputArgb: 0xFF2C2C2E,
+      foregroundArgb: 0xFFF5F5F7,
+      secondaryForegroundArgb: 0xFFB3B3B8,
+      iconArgb: 0xFFB3B3B8,
+      borderArgb: 0xFF3A3A3C,
+      accentArgb: 0xFFF2F2F2,
+      onAccentArgb: 0xFF111111,
+      destructiveArgb: 0xFFFF453A
+    ))
+    let control = UISegmentedControl(items: ["System", "Dark"])
+
+    applyNativeSheetSegmentedControlTheme(control)
+
+    let normalColor = try XCTUnwrap(
+      control.titleTextAttributes(for: .normal)?[.foregroundColor] as? UIColor
+    )
+    let selectedColor = try XCTUnwrap(
+      control.titleTextAttributes(for: .selected)?[.foregroundColor] as? UIColor
+    )
+    XCTAssertEqual(control.backgroundColor, NativeSheetTheme.shared.elevatedSurface)
+    XCTAssertEqual(control.selectedSegmentTintColor, NativeSheetTheme.shared.accent)
+    XCTAssertEqual(normalColor, NativeSheetTheme.shared.foreground)
+    XCTAssertEqual(selectedColor, NativeSheetTheme.shared.onAccent)
+  }
+
+  func testNativeModelSelectorKeepsCurrentSelectionWithPinnedModels() {
+    XCTAssertEqual(
+      nativeModelSelectorFeaturedIds(
+        pinnedModelIds: ["pinned-model"],
+        configuredFeaturedModelIds: ["fallback-model"],
+        selectedModelId: "selected-model"
+      ),
+      ["pinned-model", "selected-model"]
+    )
+    XCTAssertEqual(
+      nativeModelSelectorFeaturedIds(
+        pinnedModelIds: ["selected-model"],
+        configuredFeaturedModelIds: ["fallback-model"],
+        selectedModelId: "selected-model"
+      ),
+      ["selected-model"]
+    )
+  }
+
+  func testHermesFlutterAssetCanBeLoadedAsAnImage() {
+    let image = loadFlutterAssetImage("assets/icons/hermes_agent.png")
+    XCTAssertNotNil(image)
+  }
+
+  func testHermesAvatarCanUseTemplateRenderingInDarkMode() throws {
+    let image = try XCTUnwrap(loadFlutterAssetImage("assets/icons/hermes_agent.png"))
+
+    XCTAssertEqual(
+      nativeAvatarImage(image, isTemplate: true).renderingMode,
+      .alwaysTemplate
+    )
+    XCTAssertNotEqual(
+      nativeAvatarImage(image, isTemplate: false).renderingMode,
+      .alwaysTemplate
+    )
+  }
+
+  func testTemplateAvatarHidesFallbackInitials() throws {
+    let image = try XCTUnwrap(loadFlutterAssetImage("assets/icons/hermes_agent.png"))
+    let imageView = UIImageView()
+    let initialsLabel = UILabel()
+    imageView.isHidden = true
+    initialsLabel.isHidden = false
+
+    applyNativeAvatarImage(
+      image,
+      isTemplate: true,
+      to: imageView,
+      initialsLabel: initialsLabel
+    )
+
+    XCTAssertFalse(imageView.isHidden)
+    XCTAssertTrue(initialsLabel.isHidden)
+    XCTAssertEqual(imageView.image?.renderingMode, .alwaysTemplate)
+    XCTAssertEqual(imageView.contentMode, .scaleAspectFit)
+  }
+
+  func testNativeSheetImageCacheKeyScopesAuthenticatedImagesByHeaders() {
+    let rawUrl = "https://example.test/avatar.png"
+    let accountA = nativeSheetImageCacheKey(
+      rawUrl: rawUrl,
+      headers: ["Authorization": "Bearer account-a", "Accept": "image/png"]
+    )
+    let accountAReordered = nativeSheetImageCacheKey(
+      rawUrl: rawUrl,
+      headers: ["accept": "image/png", "authorization": "Bearer account-a"]
+    )
+    let accountB = nativeSheetImageCacheKey(
+      rawUrl: rawUrl,
+      headers: ["Authorization": "Bearer account-b", "Accept": "image/png"]
+    )
+
+    XCTAssertEqual(accountA, accountAReordered)
+    XCTAssertNotEqual(accountA, accountB)
+    XCTAssertFalse(String(accountA).contains("account-a"))
+    XCTAssertEqual(
+      nativeSheetImageCacheKey(rawUrl: rawUrl, headers: [:]),
+      NSString(string: rawUrl)
+    )
+  }
+
+  func testNativeSheetImageSessionIsBoundedAndDoesNotPersistCredentials() {
+    let configuration = nativeSheetImageSessionConfiguration()
+
+    XCTAssertEqual(configuration.httpMaximumConnectionsPerHost, 4)
+    XCTAssertEqual(
+      configuration.requestCachePolicy,
+      .reloadIgnoringLocalCacheData
+    )
+    XCTAssertNil(configuration.urlCache)
+    XCTAssertNil(configuration.httpCookieStorage)
+    XCTAssertFalse(configuration.httpShouldSetCookies)
+    XCTAssertNil(configuration.urlCredentialStorage)
+  }
+
+  func testNativeProfilePhotoFileIsDownsampledToBoundedPixels() throws {
+    let sourceImage = UIGraphicsImageRenderer(
+      size: CGSize(width: 2048, height: 1536)
+    ).image { context in
+      UIColor.systemBlue.setFill()
+      context.cgContext.fill(
+        CGRect(x: 0, y: 0, width: 2048, height: 1536)
+      )
+    }
+    let sourceData = try XCTUnwrap(
+      sourceImage.jpegData(compressionQuality: 0.9)
+    )
+    let sourceURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "\(UUID().uuidString)-profile-photo.jpg"
+    )
+    try sourceData.write(to: sourceURL, options: .atomic)
+    defer { try? FileManager.default.removeItem(at: sourceURL) }
+
+    let thumbnail = try XCTUnwrap(
+      nativeDownsampleImageFile(at: sourceURL, maxPixelSize: 1024)
+    )
+    let cgImage = try XCTUnwrap(thumbnail.cgImage)
+
+    XCTAssertLessThanOrEqual(max(cgImage.width, cgImage.height), 1024)
+    XCTAssertGreaterThan(cgImage.width, 0)
+    XCTAssertGreaterThan(cgImage.height, 0)
+  }
+
+  func testNativeSheetAvatarDataCacheKeyTracksCurrentBytes() {
+    let first = nativeSheetAvatarDataCacheKey(
+      cacheIdentifier: "presentation:model",
+      data: Data([1, 2, 3]),
+      targetPixelSize: 96
+    )
+    let firstAgain = nativeSheetAvatarDataCacheKey(
+      cacheIdentifier: "presentation:model",
+      data: Data([1, 2, 3]),
+      targetPixelSize: 96
+    )
+    let changed = nativeSheetAvatarDataCacheKey(
+      cacheIdentifier: "presentation:model",
+      data: Data([1, 2, 4]),
+      targetPixelSize: 96
+    )
+
+    XCTAssertEqual(first, firstAgain)
+    XCTAssertNotEqual(first, changed)
+    XCTAssertFalse(String(first).contains("\u{1}\u{2}\u{3}"))
+  }
+
+  func testNativeSheetRedirectsStayOnExactOrigin() throws {
+    let original = try XCTUnwrap(URL(string: "https://example.test/avatar"))
+
+    XCTAssertTrue(nativeSheetRedirectStaysWithinOrigin(
+      originalURL: original,
+      redirectURL: try XCTUnwrap(URL(string: "https://example.test:443/final"))
+    ))
+    XCTAssertFalse(nativeSheetRedirectStaysWithinOrigin(
+      originalURL: original,
+      redirectURL: try XCTUnwrap(URL(string: "https://cdn.example.test/final"))
+    ))
+    XCTAssertFalse(nativeSheetRedirectStaysWithinOrigin(
+      originalURL: original,
+      redirectURL: try XCTUnwrap(URL(string: "https://example.test:444/final"))
+    ))
+    XCTAssertFalse(nativeSheetRedirectStaysWithinOrigin(
+      originalURL: original,
+      redirectURL: try XCTUnwrap(URL(string: "http://example.test/final"))
+    ))
+
+    let googleFavicon = try XCTUnwrap(
+      URL(string: "https://www.google.com/s2/favicons?domain=example.test")
+    )
+    XCTAssertTrue(nativeSheetRedirectStaysWithinOrigin(
+      originalURL: googleFavicon,
+      redirectURL: try XCTUnwrap(
+        URL(string: "https://t3.gstatic.com/faviconV2?client=SOCIAL")
+      )
+    ))
+    XCTAssertFalse(nativeSheetRedirectStaysWithinOrigin(
+      originalURL: googleFavicon,
+      redirectURL: try XCTUnwrap(
+        URL(string: "https://t3.gstatic.com/unrelated")
+      )
+    ))
+    XCTAssertFalse(nativeSheetRedirectStaysWithinOrigin(
+      originalURL: googleFavicon,
+      redirectURL: try XCTUnwrap(
+        URL(string: "https://images.gstatic.com/faviconV2")
+      )
+    ))
+    XCTAssertFalse(nativeSheetRedirectStaysWithinOrigin(
+      originalURL: try XCTUnwrap(
+        URL(string: "https://www.google.com/unrelated")
+      ),
+      redirectURL: try XCTUnwrap(
+        URL(string: "https://t3.gstatic.com/faviconV2")
+      )
+    ))
+  }
+
+  func testNativeSheetImageHeadersRequireExplicitTrustedOrigin() throws {
+    let trusted = try XCTUnwrap(URL(string: "https://server.example:443/api"))
+    let headers = ["Authorization": "Bearer secret", "X-Tenant": "one"]
+
+    let sameOrigin = try XCTUnwrap(nativeSheetImageRequest(
+      rawUrl: "https://server.example/avatar.png",
+      headers: headers,
+      trustedServerOriginURL: trusted
+    ))
+    XCTAssertEqual(
+      sameOrigin.value(forHTTPHeaderField: "Authorization"),
+      "Bearer secret"
+    )
+    XCTAssertEqual(sameOrigin.value(forHTTPHeaderField: "X-Tenant"), "one")
+
+    // Production avatar views pass the avatar URL itself as the trust anchor
+    // because Dart only attaches headers built for that URL's server origin.
+    let selfTrusted = try XCTUnwrap(nativeSheetImageRequest(
+      rawUrl: "https://server.example/avatar.png",
+      headers: headers,
+      trustedServerOriginURL: URL(string: "https://server.example/avatar.png")
+    ))
+    XCTAssertEqual(
+      selfTrusted.value(forHTTPHeaderField: "Authorization"),
+      "Bearer secret"
+    )
+
+    let offOrigin = try XCTUnwrap(nativeSheetImageRequest(
+      rawUrl: "https://cdn.example/avatar.png",
+      headers: headers,
+      trustedServerOriginURL: trusted
+    ))
+    XCTAssertNil(offOrigin.value(forHTTPHeaderField: "Authorization"))
+    XCTAssertNil(offOrigin.value(forHTTPHeaderField: "X-Tenant"))
+
+    let noTrustAnchor = try XCTUnwrap(nativeSheetImageRequest(
+      rawUrl: "https://server.example/avatar.png",
+      headers: headers,
+      trustedServerOriginURL: nil
+    ))
+    XCTAssertTrue(noTrustAnchor.allHTTPHeaderFields?.isEmpty ?? true)
+
+    XCTAssertNotNil(nativeSheetImageRequest(
+      rawUrl: "https://cdn.example/public.png",
+      headers: [:],
+      trustedServerOriginURL: nil
+    ))
+    XCTAssertNil(nativeSheetImageRequest(
+      rawUrl: "file:///tmp/avatar.png",
+      headers: [:],
+      trustedServerOriginURL: nil
+    ))
+  }
+
+  func testNativeSheetRequestAdmissionIsGloballyBounded() {
+    let admission = NativeSheetRequestAdmission(limit: 2)
+
+    XCTAssertTrue(admission.acquire())
+    XCTAssertTrue(admission.acquire())
+    XCTAssertFalse(admission.acquire())
+    XCTAssertEqual(admission.count, 2)
+    admission.release()
+    XCTAssertTrue(admission.acquire())
+    XCTAssertEqual(admission.count, 2)
+  }
+
+  func testNativeSheetAvatarHashingRunsOffMain() {
+    let observed = expectation(description: "avatar hash observed")
+    var didRunOnMain: Bool?
+    NativeSheetImageLoader.setAvatarHashExecutionObserverForTesting { isMain in
+      didRunOnMain = isMain
+      observed.fulfill()
+    }
+    defer {
+      NativeSheetImageLoader.setAvatarHashExecutionObserverForTesting(nil)
+    }
+
+    _ = NativeSheetImageLoader.load(
+      data: Data([0, 1, 2, 3]),
+      cacheIdentifier: UUID().uuidString,
+      targetPixelSize: 16,
+      completion: { _ in }
+    )
+
+    wait(for: [observed], timeout: 1)
+    XCTAssertEqual(didRunOnMain, false)
+  }
+
+  func testNativeSheetImageLoadCancellationIsExactlyOnce() {
+    let token = NativeSheetImageLoadToken()
+    var cancellations = 0
+    token.installCancellationHandler { cancellations += 1 }
+
+    token.cancel()
+    token.cancel()
+
+    XCTAssertTrue(token.isCancelled)
+    XCTAssertEqual(cancellations, 1)
+  }
+
+  func testNativeSheetStaleImageCompletionCannotFinishReusedCacheKey() throws {
+    let cacheKey = NSString(string: "image-race-\(UUID().uuidString)")
+    var staleCompletions = 0
+    var replacementCompletions = 0
+
+    let stale = NativeSheetImageLoader.beginInFlightRequestForTesting(
+      cacheKey: cacheKey
+    ) { _ in
+      staleCompletions += 1
+    }
+    let staleRequestId = try XCTUnwrap(stale.requestId)
+    stale.token.cancel()
+
+    let replacementDelivered = expectation(
+      description: "replacement image delivered"
+    )
+    let replacement = NativeSheetImageLoader.beginInFlightRequestForTesting(
+      cacheKey: cacheKey
+    ) { _ in
+      replacementCompletions += 1
+      replacementDelivered.fulfill()
+    }
+    let replacementRequestId = try XCTUnwrap(replacement.requestId)
+    XCTAssertNotEqual(staleRequestId, replacementRequestId)
+
+    let staleNetworkToken = NativeSheetImageLoadToken()
+    NativeSheetImageLoader.installNetworkTokenForTesting(
+      staleNetworkToken,
+      cacheKey: cacheKey,
+      requestId: staleRequestId
+    )
+    XCTAssertTrue(staleNetworkToken.isCancelled)
+
+    let image = UIGraphicsImageRenderer(
+      size: CGSize(width: 1, height: 1)
+    ).image { context in
+      UIColor.black.setFill()
+      context.cgContext.fill(CGRect(x: 0, y: 0, width: 1, height: 1))
+    }
+    NativeSheetImageLoader.finishInFlightRequestForTesting(
+      cacheKey: cacheKey,
+      requestId: staleRequestId,
+      image: image
+    )
+    XCTAssertEqual(staleCompletions, 0)
+    XCTAssertEqual(replacementCompletions, 0)
+
+    NativeSheetImageLoader.finishInFlightRequestForTesting(
+      cacheKey: cacheKey,
+      requestId: replacementRequestId,
+      image: image
+    )
+    wait(for: [replacementDelivered], timeout: 1)
+    XCTAssertEqual(staleCompletions, 0)
+    XCTAssertEqual(replacementCompletions, 1)
+  }
+
+  func testNativeSheetModelUpdateIsAppliedOnMainBeforeOffMainCallReturns() {
+    let applied = expectation(description: "model update applied")
+
+    DispatchQueue.global(qos: .userInitiated).async {
+      var didApply = false
+      applyNativeSheetModelUpdateSynchronouslyOnMain(
+        presentationId: "current-presentation",
+        activePresentationId: { "current-presentation" },
+        update: {
+          XCTAssertTrue(Thread.isMainThread)
+          didApply = true
+        }
+      )
+      XCTAssertTrue(didApply)
+      applied.fulfill()
+    }
+
+    wait(for: [applied], timeout: 1)
+  }
+
+  @MainActor
+  func testNativeVoiceLanguageFilterKeepsOnlySelectedUnknownVoice() throws {
+    let payload: [String: Any] = [
+      "title": "Voices", "filterAllLabel": "All languages", "selectedOptionId": "cloud",
+      "options": [
+        ["id": "default", "label": "System default", "filterGroup": ""],
+        ["id": "iris", "label": "Iris", "filterGroup": "French"],
+        ["id": "maple", "label": "Maple", "filterGroup": "English"],
+        ["id": "cloud", "label": "Cloud voice"],
+        ["id": "other", "label": "Other cloud voice"],
+      ],
+    ]
+    func texts(in view: UIView) -> [String] {
+      (view as? UILabel).flatMap(\.text).map { [$0] } ?? view.subviews.flatMap { texts(in: $0) }
+    }
+    for (filter, expected) in [
+      (nil as String?, ["System default", "Iris", "Maple", "Cloud voice", "Other cloud voice"]),
+      ("French", ["System default", "Iris", "Cloud voice"]),
+    ] {
+      let controller = try XCTUnwrap(NativeOptionsSelectorTableViewController.makeForTesting(payload, filterGroup: filter))
+      let table = try XCTUnwrap(controller.view.subviews.compactMap { $0 as? UITableView }.first)
+      let source = try XCTUnwrap(table.dataSource)
+      if filter == "French" {
+        let search = try XCTUnwrap(controller.navigationItem.searchController)
+        let updater = try XCTUnwrap(controller as? UISearchResultsUpdating)
+        search.searchBar.text = "unmatched"
+        updater.updateSearchResults(for: search)
+        XCTAssertEqual(source.tableView(table, numberOfRowsInSection: 0), 0)
+        search.searchBar.text = nil
+        updater.updateSearchResults(for: search)
+      }
+      let count = source.tableView(table, numberOfRowsInSection: 0)
+      XCTAssertEqual(count, expected.count)
+      var labels: [String] = []
+      for row in 0..<count {
+        let cell = source.tableView(table, cellForRowAt: IndexPath(row: row, section: 0))
+        labels.append(contentsOf: texts(in: cell.contentView))
+        XCTAssertEqual(cell.accessoryType, labels.last == "Cloud voice" ? .checkmark : .none)
+      }
+      XCTAssertEqual(labels, expected)
+    }
+  }
+
+  func testNativeSheetModelUpdateRejectsStalePresentation() {
+    var didApply = false
+
+    applyNativeSheetModelUpdateSynchronouslyOnMain(
+      presentationId: "stale-presentation",
+      activePresentationId: { "current-presentation" },
+      update: { didApply = true }
+    )
+
+    XCTAssertFalse(didApply)
+  }
+
+  func testNativeSheetPageRowsSendAsTheSheetStartsLeaving() {
+    // Rows that open a Flutter page tell Flutter at once, so the page is
+    // already underneath while the sheet slides away.
+    for actionId in [
+      "open-personal-connections",
+      "open-scheduled-tasks",
+      "open-chat-data-controls",
+      "open-calendar",
+      "workspace-entry",
+      "notification-targets",
+      "release-notes-manual",
+      "open-source-licenses",
+      "add-owui-server",
+    ] {
+      XCTAssertFalse(
+        nativeSheetSelectionWaitsForDismiss(actionId: actionId),
+        actionId
+      )
+    }
+  }
+
+  func testNativeSheetMemoryEditorWaitsForTheSheetToLeave() {
+    // The memory editor takes keyboard focus, so it opens only once the
+    // sheet has gone.
+    XCTAssertTrue(nativeSheetSelectionWaitsForDismiss(actionId: "memory-editor-new"))
+    XCTAssertTrue(
+      nativeSheetSelectionWaitsForDismiss(actionId: "memory-editor:abc%20123")
+    )
+  }
+
+  func testNativeSheetAccountQuestionsWaitForTheSheetToLeave() {
+    // Switching, adding or signing out of an account may ask in a sheet of
+    // its own, and editing a Direct provider opens one; a server's page only
+    // opens under the sheet.
+    for actionId in [
+      "account-switch", "account-add", "account-sign-out", "account-direct-edit",
+    ] {
+      XCTAssertTrue(
+        nativeSheetSelectionWaitsForDismiss(actionId: actionId),
+        actionId
+      )
+    }
+    XCTAssertFalse(nativeSheetSelectionWaitsForDismiss(actionId: "account-server"))
+  }
+
+  func testNativeSheetRootPatchUsesTheReservedProfileMenuId() {
+    XCTAssertEqual(nativeSheetProfileMenuDetailId, "profile-menu")
+  }
+
+  func testAppIntentReadinessIsAppliedBeforeUpdateReturns() {
+    let readiness = AppIntentReadiness()
+
+    XCTAssertFalse(readiness.currentValue())
+    readiness.update(true)
+    XCTAssertTrue(readiness.currentValue())
+    readiness.update(false)
+    XCTAssertFalse(readiness.currentValue())
+  }
+
+  func testAppIntentReadinessWaiterResumesOnReadyTransition() async {
+    let readiness = AppIntentReadiness()
+    let waiter = Task {
+      await readiness.waitUntilReady(timeoutNanoseconds: 1_000_000_000)
+    }
+
+    try? await Task.sleep(nanoseconds: 10_000_000)
+    readiness.update(true)
+
+    let becameReady = await waiter.value
+    XCTAssertTrue(becameReady)
+  }
+
+  func testAppIntentReadinessWaiterUsesSingleTimeout() async {
+    let readiness = AppIntentReadiness()
+    let startedAt = ProcessInfo.processInfo.systemUptime
+
+    let becameReady = await readiness.waitUntilReady(
+      timeoutNanoseconds: 10_000_000
+    )
+
+    XCTAssertFalse(becameReady)
+    XCTAssertLessThan(
+      ProcessInfo.processInfo.systemUptime - startedAt,
+      0.5
+    )
+  }
+
+  func testCancelledAppIntentReadinessWaitReturnsPromptly() async {
+    let previousBridge = AppIntentBridge.shared
+    AppIntentBridge.shared = nil
+    defer { AppIntentBridge.shared = previousBridge }
+    let startedAt = ProcessInfo.processInfo.systemUptime
+    let task = Task { await AppIntentBridge.readyBridge() }
+    task.cancel()
+
+    let bridge = await task.value
+
+    XCTAssertNil(bridge)
+    XCTAssertLessThan(
+      ProcessInfo.processInfo.systemUptime - startedAt,
+      0.5
+    )
+  }
+
+  private func nativePasteTestRoot() -> URL {
+    FileManager.default.temporaryDirectory.appendingPathComponent(
+      "conduit-native-paste-tests-\(UUID().uuidString.lowercased())",
+      isDirectory: true
+    )
+  }
+
+  private func createNativePasteDelivery(
+    in store: NativePasteDeliveryStore,
+    bytes: Data = Data([1, 2, 3])
+  ) throws -> (id: String, item: URL) {
+    let deliveryId = try XCTUnwrap(store.createDelivery())
+    let item = try XCTUnwrap(store.stagingURL(
+      deliveryId: deliveryId,
+      fileExtension: "png"
+    ))
+    try bytes.write(to: item)
+    return (deliveryId, item)
+  }
+
+  private func nativePasteMarker(
+    _ store: NativePasteDeliveryStore,
+    deliveryId: String,
+    state: NativePasteDeliveryMarkerState
+  ) throws -> URL {
+    try XCTUnwrap(store.markerURL(
+      deliveryId: deliveryId,
+      state: state
+    ))
+  }
+
+  private func moveNativePasteMarker(
+    _ store: NativePasteDeliveryStore,
+    deliveryId: String,
+    from sourceState: NativePasteDeliveryMarkerState,
+    to destinationState: NativePasteDeliveryMarkerState
+  ) throws {
+    try FileManager.default.moveItem(
+      at: nativePasteMarker(
+        store,
+        deliveryId: deliveryId,
+        state: sourceState
+      ),
+      to: nativePasteMarker(
+        store,
+        deliveryId: deliveryId,
+        state: destinationState
+      )
+    )
+  }
+
+  private func nativePasteEntryExistsNoFollow(_ url: URL) -> Bool {
+    var metadata = stat()
+    return url.path.withCString { lstat($0, &metadata) == 0 }
+  }
+
+  private func nativePasteHasAnyMarker(
+    _ store: NativePasteDeliveryStore,
+    deliveryId: String
+  ) -> Bool {
+    NativePasteDeliveryMarkerState.allCases.contains { state in
+      guard let marker = store.markerURL(
+        deliveryId: deliveryId,
+        state: state
+      ) else { return false }
+      return nativePasteEntryExistsNoFollow(marker)
+    }
+  }
+
+  func testNativePasteInPlaceReadIsFileCoordinated() throws {
+    let source = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "native-paste-coordinated-\(UUID().uuidString).png"
+    )
+    let expected = Data([0x89, 0x50, 0x4e, 0x47])
+    try expected.write(to: source, options: .atomic)
+    defer { try? FileManager.default.removeItem(at: source) }
+
+    var coordinatedURL: URL?
+    let actual = withCoordinatedNativePasteRead(at: source) { url in
+      coordinatedURL = url
+      return try? Data(contentsOf: url)
+    }
+
+    XCTAssertEqual(actual, expected)
+    XCTAssertNotNil(coordinatedURL)
+  }
+
+  func testNativePasteDefaultStoreMatchesDartTemporaryRoot() throws {
+    let cacheRoot = try XCTUnwrap(
+      FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+    )
+    XCTAssertEqual(
+      NativePasteDeliveryStore().rootURL,
+      cacheRoot.appendingPathComponent(
+        NativePasteDeliveryStore.stagingDirectoryName,
+        isDirectory: true
+      ).standardizedFileURL
+    )
+  }
+
+  func testNativePasteRejectsMalformedAdvertisedPngData() {
+    XCTAssertNil(nativePasteValidatedImageTypeIdentifier(
+      for: Data([0x89, 0x50, 0x4e, 0x47]),
+      advertisedIdentifier: "public.png"
+    ))
+  }
+
+  func testNativePasteTrustsDetectedTypeOverAdvertisedType() {
+    let pngData = UIGraphicsImageRenderer(
+      size: CGSize(width: 1, height: 1)
+    ).pngData { context in
+      context.cgContext.setFillColor(UIColor.red.cgColor)
+      context.cgContext.fill(CGRect(x: 0, y: 0, width: 1, height: 1))
+    }
+
+    XCTAssertEqual(
+      nativePasteValidatedImageTypeIdentifier(
+        for: pngData,
+        advertisedIdentifier: "public.jpeg"
+      ),
+      "public.png"
+    )
+  }
+
+  func testNativePasteStagesDataRepresentationBeforeFileFallback() {
+    let expectedData = Data([0x89, 0x50, 0x4e, 0x47])
+    let stagedURL = URL(fileURLWithPath: "/tmp/native-paste-data.png")
+    var loadOrder: [String] = []
+    var stagedData: Data?
+    var result: (URL?, Int64)?
+    let representations = NativePasteProviderRepresentations(
+      loadData: { completion in
+        loadOrder.append("data")
+        completion(expectedData, nil)
+      },
+      loadFile: { completion in
+        loadOrder.append("file")
+        completion(nil, nil)
+      },
+      loadInPlaceFile: { completion in
+        loadOrder.append("in-place")
+        completion(nil, false, nil)
+      }
+    )
+    let stager = NativePasteProviderStager(
+      stageData: { data in
+        stagedData = data
+        return (stagedURL, Int64(data.count))
+      },
+      stageFile: { _ in nil },
+      stageInPlaceFile: { _ in nil }
+    )
+
+    stager.stage(representations: representations, maxBytes: 1024) {
+      result = ($0, $1)
+    }
+
+    XCTAssertEqual(loadOrder, ["data"])
+    XCTAssertEqual(stagedData, expectedData)
+    XCTAssertEqual(result?.0, stagedURL)
+    XCTAssertEqual(result?.1, Int64(expectedData.count))
+  }
+
+  func testNativePasteFallsBackToFileWhenDataIsUnavailable() {
+    let sourceURL = URL(fileURLWithPath: "/tmp/native-paste-source.png")
+    let stagedURL = URL(fileURLWithPath: "/tmp/native-paste-staged.png")
+    var loadOrder: [String] = []
+    var result: (URL?, Int64)?
+    let representations = NativePasteProviderRepresentations(
+      loadData: { completion in
+        loadOrder.append("data")
+        completion(nil, CocoaError(.fileReadUnknown))
+      },
+      loadFile: { completion in
+        loadOrder.append("file")
+        completion(sourceURL, nil)
+      },
+      loadInPlaceFile: { completion in
+        loadOrder.append("in-place")
+        completion(nil, false, nil)
+      }
+    )
+    let stager = NativePasteProviderStager(
+      stageData: { _ in nil },
+      stageFile: { url in
+        XCTAssertEqual(url, sourceURL)
+        return (stagedURL, 4)
+      },
+      stageInPlaceFile: { _ in nil }
+    )
+
+    stager.stage(representations: representations, maxBytes: 1024) {
+      result = ($0, $1)
+    }
+
+    XCTAssertEqual(loadOrder, ["data", "file"])
+    XCTAssertEqual(result?.0, stagedURL)
+    XCTAssertEqual(result?.1, 4)
+  }
+
+  func testNativePasteCreatesPendingMarkerBeforeAnyStagedItem() throws {
+    let root = nativePasteTestRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = NativePasteDeliveryStore(rootURL: root)
+
+    let deliveryId = try XCTUnwrap(store.createDelivery())
+    let pending = try nativePasteMarker(
+      store,
+      deliveryId: deliveryId,
+      state: .pending
+    )
+    let initialEntries = try FileManager.default.contentsOfDirectory(
+      at: root,
+      includingPropertiesForKeys: nil
+    )
+
+    XCTAssertEqual(deliveryId, deliveryId.lowercased())
+    XCTAssertEqual(initialEntries, [pending])
+    XCTAssertTrue(nativePasteEntryExistsNoFollow(pending))
+
+    let staged = try XCTUnwrap(store.stagingURL(
+      deliveryId: deliveryId,
+      fileExtension: "png"
+    ))
+    XCTAssertTrue(staged.lastPathComponent.hasPrefix("\(deliveryId)-"))
+    XCTAssertTrue(staged.lastPathComponent.hasSuffix("-paste.png"))
+    XCTAssertNil(store.stagingURL(
+      deliveryId: deliveryId.uppercased(),
+      fileExtension: "png"
+    ))
+  }
+
+  func testRejectedNativePasteReclaimsOnlyStrictDeliveryItems() throws {
+    let root = nativePasteTestRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = NativePasteDeliveryStore(rootURL: root)
+    let delivery = try createNativePasteDelivery(in: store)
+    let omitted = try XCTUnwrap(store.stagingURL(
+      deliveryId: delivery.id,
+      fileExtension: "png"
+    ))
+    try Data([4, 5, 6]).write(to: omitted)
+    let unrelated = root.appendingPathComponent("unrelated.png")
+    try Data([9]).write(to: unrelated)
+    let queue = DispatchQueue(label: "native-paste-test-rejection")
+    var acknowledgements: [Bool] = []
+    let ownership = NativePasteDeliveryOwnership(
+      deliveryId: delivery.id,
+      store: store,
+      operationQueue: queue,
+      acknowledgement: { acknowledgements.append($0) }
+    )
+
+    XCTAssertFalse(ownership.resolveFromDart(decision: .rejected))
+    queue.sync {}
+
+    XCTAssertEqual(acknowledgements, [false])
+    XCTAssertFalse(nativePasteEntryExistsNoFollow(delivery.item))
+    XCTAssertFalse(nativePasteEntryExistsNoFollow(omitted))
+    XCTAssertTrue(nativePasteEntryExistsNoFollow(unrelated))
+    XCTAssertFalse(nativePasteHasAnyMarker(store, deliveryId: delivery.id))
+  }
+
+  func testAcceptedNativePasteFinalizesDartMarkerAndPreservesItems() throws {
+    let root = nativePasteTestRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = NativePasteDeliveryStore(rootURL: root)
+    let delivery = try createNativePasteDelivery(in: store)
+    try moveNativePasteMarker(
+      store,
+      deliveryId: delivery.id,
+      from: .pending,
+      to: .dartOwned
+    )
+    let queue = DispatchQueue(label: "native-paste-test-accepted")
+    var acknowledgements: [Bool] = []
+    let ownership = NativePasteDeliveryOwnership(
+      deliveryId: delivery.id,
+      store: store,
+      operationQueue: queue,
+      acknowledgement: { acknowledgements.append($0) }
+    )
+
+    XCTAssertTrue(ownership.resolveFromDart(decision: .accepted))
+    queue.sync {}
+
+    XCTAssertEqual(acknowledgements, [true])
+    XCTAssertTrue(nativePasteEntryExistsNoFollow(delivery.item))
+    XCTAssertFalse(nativePasteHasAnyMarker(store, deliveryId: delivery.id))
+  }
+
+  func testNativePasteFallbackRequiresUnchangedResponderAndPasteboard() {
+    let original = NativePasteEditorContext(
+      documentText: "draft",
+      selectionStart: 5,
+      selectionEnd: 5
+    )
+    XCTAssertTrue(nativePasteFallbackContextMatches(
+      responderIsFirstResponder: true,
+      expectedPasteboardChangeCount: 7,
+      currentPasteboardChangeCount: 7,
+      expectedEditorContext: original,
+      currentEditorContext: original
+    ))
+    XCTAssertFalse(nativePasteFallbackContextMatches(
+      responderIsFirstResponder: false,
+      expectedPasteboardChangeCount: 7,
+      currentPasteboardChangeCount: 7,
+      expectedEditorContext: original,
+      currentEditorContext: original
+    ))
+    XCTAssertFalse(nativePasteFallbackContextMatches(
+      responderIsFirstResponder: true,
+      expectedPasteboardChangeCount: 7,
+      currentPasteboardChangeCount: 8,
+      expectedEditorContext: original,
+      currentEditorContext: original
+    ))
+    XCTAssertFalse(nativePasteFallbackContextMatches(
+      responderIsFirstResponder: true,
+      expectedPasteboardChangeCount: 7,
+      currentPasteboardChangeCount: 7,
+      expectedEditorContext: original,
+      currentEditorContext: NativePasteEditorContext(
+        documentText: "draft changed",
+        selectionStart: 13,
+        selectionEnd: 13
+      )
+    ))
+  }
+
+  func testIndeterminateNativePasteDecisionSuppressesFallback() {
+    let result: Result<Bool, NSError> = .failure(
+      NSError(domain: "test", code: 1)
+    )
+
+    XCTAssertEqual(
+      NativePasteBridge.pasteDeliveryDecision(result),
+      .indeterminate
+    )
+    XCTAssertTrue(NativePasteBridge.pasteDeliveryDecision(result)
+      .suppressesFallbackPaste)
+  }
+
+  func testNativePasteDeliveryCompletionAcknowledgesExactlyOnce() {
+    var acknowledgements: [Bool] = []
+    let completion = NativePasteDeliveryCompletion {
+      acknowledgements.append($0)
+    }
+
+    XCTAssertTrue(completion.resolve(false))
+    XCTAssertFalse(completion.resolve(true))
+    XCTAssertEqual(acknowledgements, [false])
+  }
+
+  func testNativePasteAcknowledgementTimeoutReclaimsPendingDelivery() throws {
+    let root = nativePasteTestRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = NativePasteDeliveryStore(rootURL: root)
+    let staged = try createNativePasteDelivery(in: store)
+    let queue = DispatchQueue(label: "native-paste-test-timeout")
+    var acknowledgements: [Bool] = []
+    let delivery = NativePasteDeliveryOwnership(
+      deliveryId: staged.id,
+      store: store,
+      operationQueue: queue,
+      acknowledgement: { acknowledgements.append($0) }
+    )
+
+    delivery.acknowledgementTimedOut()
+    queue.sync {}
+
+    XCTAssertEqual(acknowledgements, [false])
+    XCTAssertFalse(nativePasteEntryExistsNoFollow(staged.item))
+    XCTAssertFalse(nativePasteHasAnyMarker(store, deliveryId: staged.id))
+
+    XCTAssertFalse(delivery.resolveFromDart(decision: .accepted))
+    XCTAssertFalse(delivery.resolveFromDart(consumed: false))
+    XCTAssertEqual(acknowledgements, [false])
+    XCTAssertFalse(nativePasteEntryExistsNoFollow(staged.item))
+  }
+
+  func testNativePasteTimeoutAcknowledgesAfterOwnershipSettlement() throws {
+    let root = nativePasteTestRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = NativePasteDeliveryStore(rootURL: root)
+    let staged = try createNativePasteDelivery(in: store)
+    let queue = DispatchQueue(label: "native-paste-test-timeout-ordering")
+    let blockerStarted = expectation(description: "operation queue blocked")
+    let unblock = DispatchSemaphore(value: 0)
+    defer { unblock.signal() }
+    queue.async {
+      blockerStarted.fulfill()
+      unblock.wait()
+    }
+    wait(for: [blockerStarted], timeout: 1)
+
+    var acknowledgements: [Bool] = []
+    let delivery = NativePasteDeliveryOwnership(
+      deliveryId: staged.id,
+      store: store,
+      operationQueue: queue,
+      acknowledgement: { acknowledgements.append($0) }
+    )
+
+    delivery.acknowledgementTimedOut()
+    XCTAssertTrue(acknowledgements.isEmpty)
+    XCTAssertTrue(nativePasteEntryExistsNoFollow(staged.item))
+
+    unblock.signal()
+    queue.sync {}
+    XCTAssertEqual(acknowledgements, [false])
+    XCTAssertFalse(nativePasteEntryExistsNoFollow(staged.item))
+  }
+
+  func testNativePasteTimeoutCannotOverrideReservedDartRejection() throws {
+    let root = nativePasteTestRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = NativePasteDeliveryStore(rootURL: root)
+    let staged = try createNativePasteDelivery(in: store)
+    let queue = DispatchQueue(label: "native-paste-test-reserved-rejection")
+    let blockerStarted = expectation(description: "operation queue blocked")
+    let unblock = DispatchSemaphore(value: 0)
+    defer { unblock.signal() }
+    queue.async {
+      blockerStarted.fulfill()
+      unblock.wait()
+    }
+    wait(for: [blockerStarted], timeout: 1)
+
+    var acknowledgements: [Bool] = []
+    let delivery = NativePasteDeliveryOwnership(
+      deliveryId: staged.id,
+      store: store,
+      operationQueue: queue,
+      acknowledgement: { acknowledgements.append($0) }
+    )
+
+    XCTAssertFalse(delivery.resolveFromDart(decision: .rejected))
+    delivery.acknowledgementTimedOut()
+    XCTAssertTrue(acknowledgements.isEmpty)
+
+    unblock.signal()
+    queue.sync {}
+    XCTAssertEqual(acknowledgements, [false])
+    XCTAssertFalse(nativePasteEntryExistsNoFollow(staged.item))
+  }
+
+  func testNativePasteTimeoutSeeingDartOwnershipPreservesItems() throws {
+    let root = nativePasteTestRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = NativePasteDeliveryStore(rootURL: root)
+    let staged = try createNativePasteDelivery(in: store)
+    try moveNativePasteMarker(
+      store,
+      deliveryId: staged.id,
+      from: .pending,
+      to: .dartOwned
+    )
+    let queue = DispatchQueue(label: "native-paste-test-owned-timeout")
+    var acknowledgements: [Bool] = []
+    let delivery = NativePasteDeliveryOwnership(
+      deliveryId: staged.id,
+      store: store,
+      operationQueue: queue,
+      acknowledgement: { acknowledgements.append($0) }
+    )
+
+    delivery.acknowledgementTimedOut()
+    queue.sync {}
+
+    XCTAssertEqual(acknowledgements, [true])
+    XCTAssertTrue(nativePasteEntryExistsNoFollow(staged.item))
+    XCTAssertFalse(nativePasteHasAnyMarker(store, deliveryId: staged.id))
+  }
+
+  func testRejectedClaimWithFailedRollbackPreservesDartOwnedItems() throws {
+    let root = nativePasteTestRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = NativePasteDeliveryStore(rootURL: root)
+    let staged = try createNativePasteDelivery(in: store)
+    try moveNativePasteMarker(
+      store,
+      deliveryId: staged.id,
+      from: .pending,
+      to: .dartOwned
+    )
+    let queue = DispatchQueue(label: "native-paste-test-failed-rollback")
+    var acknowledgements: [Bool] = []
+    let delivery = NativePasteDeliveryOwnership(
+      deliveryId: staged.id,
+      store: store,
+      operationQueue: queue,
+      acknowledgement: { acknowledgements.append($0) }
+    )
+
+    XCTAssertFalse(delivery.resolveFromDart(decision: .rejected))
+    queue.sync {}
+
+    XCTAssertEqual(acknowledgements, [true])
+    XCTAssertTrue(nativePasteEntryExistsNoFollow(staged.item))
+    XCTAssertFalse(nativePasteHasAnyMarker(store, deliveryId: staged.id))
+  }
+
+  func testNativeAndDartMarkerRenamesHaveExactlyOneWinner() throws {
+    for iteration in 0..<40 {
+      let root = nativePasteTestRoot()
+      defer { try? FileManager.default.removeItem(at: root) }
+      let store = NativePasteDeliveryStore(rootURL: root)
+      let staged = try createNativePasteDelivery(in: store)
+      let pending = try nativePasteMarker(
+        store,
+        deliveryId: staged.id,
+        state: .pending
+      )
+      let dartOwned = try nativePasteMarker(
+        store,
+        deliveryId: staged.id,
+        state: .dartOwned
+      )
+      let start = DispatchSemaphore(value: 0)
+      let group = DispatchGroup()
+      let lock = NSLock()
+      var dartWon = false
+      var settlement: NativePasteDeliverySettlement?
+
+      group.enter()
+      DispatchQueue.global(qos: .userInitiated).async {
+        start.wait()
+        let result = store.settle(deliveryId: staged.id)
+        lock.lock()
+        settlement = result
+        lock.unlock()
+        group.leave()
+      }
+      group.enter()
+      DispatchQueue.global(qos: .userInitiated).async {
+        start.wait()
+        do {
+          try FileManager.default.moveItem(at: pending, to: dartOwned)
+          lock.lock()
+          dartWon = true
+          lock.unlock()
+        } catch {}
+        group.leave()
+      }
+      start.signal()
+      start.signal()
+      XCTAssertEqual(group.wait(timeout: .now() + 2), .success)
+
+      lock.lock()
+      let observedDartWin = dartWon
+      let observedSettlement = settlement
+      lock.unlock()
+      XCTAssertEqual(
+        observedSettlement,
+        observedDartWin ? .dartOwned : .reclaimed,
+        "iteration \(iteration)"
+      )
+      XCTAssertEqual(
+        nativePasteEntryExistsNoFollow(staged.item),
+        observedDartWin,
+        "iteration \(iteration)"
+      )
+      XCTAssertFalse(nativePasteHasAnyMarker(
+        store,
+        deliveryId: staged.id
+      ))
+    }
+  }
+
+  func testNativePasteStartupReconciliationIsStrictAndNoFollow() throws {
+    let root = nativePasteTestRoot()
+    let outsideTarget = FileManager.default.temporaryDirectory
+      .appendingPathComponent("\(UUID().uuidString.lowercased())-outside.png")
+    defer {
+      try? FileManager.default.removeItem(at: root)
+      try? FileManager.default.removeItem(at: outsideTarget)
+    }
+    try Data([7, 8, 9]).write(to: outsideTarget)
+    let store = NativePasteDeliveryStore(rootURL: root)
+
+    let pending = try createNativePasteDelivery(in: store)
+    let reclaiming = try createNativePasteDelivery(in: store)
+    try moveNativePasteMarker(
+      store,
+      deliveryId: reclaiming.id,
+      from: .pending,
+      to: .reclaiming
+    )
+    let dartOwned = try createNativePasteDelivery(in: store)
+    try moveNativePasteMarker(
+      store,
+      deliveryId: dartOwned.id,
+      from: .pending,
+      to: .dartOwned
+    )
+
+    let unmarkedId = UUID().uuidString.lowercased()
+    let unmarked = try XCTUnwrap(store.stagingURL(
+      deliveryId: unmarkedId,
+      fileExtension: "png"
+    ))
+    try Data([1]).write(to: unmarked)
+    let legacy = root.appendingPathComponent(
+      "\(UUID().uuidString.lowercased())-native-paste.png"
+    )
+    try Data([2]).write(to: legacy)
+    let malformedMarker = root.appendingPathComponent(
+      ".conduit-native-paste-v2-not-a-uuid.pending"
+    )
+    try Data().write(to: malformedMarker)
+
+    let linkedMarkerId = UUID().uuidString.lowercased()
+    let linkedMarker = try nativePasteMarker(
+      store,
+      deliveryId: linkedMarkerId,
+      state: .pending
+    )
+    try FileManager.default.createSymbolicLink(
+      at: linkedMarker,
+      withDestinationURL: outsideTarget
+    )
+    let linkedMarkerItem = try XCTUnwrap(store.stagingURL(
+      deliveryId: linkedMarkerId,
+      fileExtension: "png"
+    ))
+    try Data([3]).write(to: linkedMarkerItem)
+
+    let linkedItemDelivery = try XCTUnwrap(store.createDelivery())
+    let linkedItem = try XCTUnwrap(store.stagingURL(
+      deliveryId: linkedItemDelivery,
+      fileExtension: "png"
+    ))
+    try FileManager.default.createSymbolicLink(
+      at: linkedItem,
+      withDestinationURL: outsideTarget
+    )
+
+    let wrongPrefix = root.appendingPathComponent(
+      "\(pending.id)-not-a-uuid-paste.png"
+    )
+    try Data([4]).write(to: wrongPrefix)
+
+    store.reconcileStartup()
+
+    XCTAssertFalse(nativePasteEntryExistsNoFollow(pending.item))
+    XCTAssertFalse(nativePasteHasAnyMarker(store, deliveryId: pending.id))
+    XCTAssertFalse(nativePasteEntryExistsNoFollow(reclaiming.item))
+    XCTAssertFalse(nativePasteHasAnyMarker(
+      store,
+      deliveryId: reclaiming.id
+    ))
+    XCTAssertTrue(nativePasteEntryExistsNoFollow(dartOwned.item))
+    XCTAssertTrue(nativePasteEntryExistsNoFollow(try nativePasteMarker(
+      store,
+      deliveryId: dartOwned.id,
+      state: .dartOwned
+    )))
+    XCTAssertTrue(nativePasteEntryExistsNoFollow(unmarked))
+    XCTAssertTrue(nativePasteEntryExistsNoFollow(legacy))
+    XCTAssertTrue(nativePasteEntryExistsNoFollow(malformedMarker))
+    XCTAssertNoThrow(try FileManager.default.destinationOfSymbolicLink(
+      atPath: linkedMarker.path
+    ))
+    XCTAssertTrue(nativePasteEntryExistsNoFollow(linkedMarkerItem))
+    XCTAssertNoThrow(try FileManager.default.destinationOfSymbolicLink(
+      atPath: linkedItem.path
+    ))
+    XCTAssertTrue(nativePasteEntryExistsNoFollow(outsideTarget))
+    XCTAssertTrue(nativePasteEntryExistsNoFollow(wrongPrefix))
+  }
+
+  func testNativePasteStartupGateRetriesFailedEnumerationBeforeAdmission() throws {
+    let root = nativePasteTestRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let initialStore = NativePasteDeliveryStore(rootURL: root)
+    let stale = try createNativePasteDelivery(in: initialStore)
+    var failEnumeration = true
+    let retryingStore = NativePasteDeliveryStore(
+      rootURL: root,
+      directoryContentsForTesting: { url in
+        if failEnumeration { return nil }
+        return try? FileManager.default.contentsOfDirectory(
+          at: url,
+          includingPropertiesForKeys: nil,
+          options: [.skipsSubdirectoryDescendants]
+        )
+      }
+    )
+    let gate = NativePasteStartupGate()
+
+    XCTAssertNil(gate.createDeliveryAfterReconciliation(store: retryingStore))
+    XCTAssertTrue(nativePasteEntryExistsNoFollow(stale.item))
+    XCTAssertTrue(nativePasteHasAnyMarker(
+      retryingStore,
+      deliveryId: stale.id
+    ))
+
+    failEnumeration = false
+    let admittedId = try XCTUnwrap(
+      gate.createDeliveryAfterReconciliation(store: retryingStore)
+    )
+
+    XCTAssertFalse(nativePasteEntryExistsNoFollow(stale.item))
+    XCTAssertFalse(nativePasteHasAnyMarker(
+      retryingStore,
+      deliveryId: stale.id
+    ))
+    XCTAssertTrue(nativePasteEntryExistsNoFollow(try nativePasteMarker(
+      retryingStore,
+      deliveryId: admittedId,
+      state: .pending
+    )))
+  }
+
+  func testNativePasteFailedUnlinkKeepsReclaimMarkerForStartupRetry() throws {
+    let root = nativePasteTestRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let initialStore = NativePasteDeliveryStore(rootURL: root)
+    let staged = try createNativePasteDelivery(in: initialStore)
+    var failItemDeletion = true
+    let retryingStore = NativePasteDeliveryStore(
+      rootURL: root,
+      removeItemForTesting: { url in
+        if failItemDeletion, url.standardizedFileURL == staged.item {
+          return false
+        }
+        do {
+          try FileManager.default.removeItem(at: url)
+          return true
+        } catch {
+          return false
+        }
+      }
+    )
+
+    XCTAssertEqual(
+      retryingStore.settle(deliveryId: staged.id),
+      .preservedUnknown
+    )
+    XCTAssertTrue(nativePasteEntryExistsNoFollow(staged.item))
+    XCTAssertTrue(nativePasteEntryExistsNoFollow(try nativePasteMarker(
+      retryingStore,
+      deliveryId: staged.id,
+      state: .reclaiming
+    )))
+
+    failItemDeletion = false
+    XCTAssertTrue(retryingStore.reconcileStartup())
+    XCTAssertFalse(nativePasteEntryExistsNoFollow(staged.item))
+    XCTAssertFalse(nativePasteHasAnyMarker(
+      retryingStore,
+      deliveryId: staged.id
+    ))
+  }
+
+  func testNativePasteTimeoutMarkerSurvivesForLateCopyReconciliation() throws {
+    let root = nativePasteTestRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let store = NativePasteDeliveryStore(rootURL: root)
+    let deliveryId = try XCTUnwrap(store.createDelivery())
+    var providerCompletion: ((PlatformNativePasteImageItem?, Int64) -> Void)?
+    var completions = 0
+    var timeoutDrained = 0
+    let coordinator = NativePasteStagingCoordinator(
+      providerCount: 1,
+      maxItemCount: 1,
+      maxItemBytes: 10,
+      maxAggregateBytes: 10,
+      removeItems: { items in
+        store.removeStrictItems(deliveryId: deliveryId, items: items)
+      },
+      onTimeoutStarted: {
+        XCTAssertTrue(store.beginReclaiming(deliveryId: deliveryId))
+      },
+      onTimeoutDrained: {
+        timeoutDrained += 1
+        _ = store.settle(deliveryId: deliveryId)
+      },
+      completion: { items, timedOut in
+        XCTAssertTrue(timedOut)
+        XCTAssertTrue(items.isEmpty)
+        completions += 1
+      }
+    )
+    coordinator.start { _, _, completion in
+      providerCompletion = completion
+    }
+
+    coordinator.timeout()
+    let latePartial = try XCTUnwrap(store.stagingURL(
+      deliveryId: deliveryId,
+      fileExtension: "png"
+    ))
+    try Data([1, 2, 3]).write(to: latePartial)
+
+    XCTAssertEqual(completions, 1)
+    XCTAssertEqual(timeoutDrained, 0)
+    XCTAssertTrue(nativePasteEntryExistsNoFollow(latePartial))
+    XCTAssertTrue(nativePasteEntryExistsNoFollow(try nativePasteMarker(
+      store,
+      deliveryId: deliveryId,
+      state: .reclaiming
+    )))
+
+    // Simulate process death before the non-cancellable provider callback.
+    let restartedStore = NativePasteDeliveryStore(rootURL: root)
+    XCTAssertTrue(restartedStore.reconcileStartup())
+    XCTAssertFalse(nativePasteEntryExistsNoFollow(latePartial))
+    XCTAssertFalse(nativePasteHasAnyMarker(
+      restartedStore,
+      deliveryId: deliveryId
+    ))
+
+    // A late callback still cannot redeliver or complete the paste twice.
+    providerCompletion?(PlatformNativePasteImageItem(
+      mimeType: "image/png",
+      filePath: latePartial.path
+    ), 3)
+    coordinator.timeout()
+    XCTAssertEqual(completions, 1)
+    XCTAssertEqual(timeoutDrained, 1)
+  }
+
+  func testNativePasteStagesAcrossFailuresUntilSuccessfulLimit() {
+    let oversize = PlatformNativePasteImageItem(
+      mimeType: "image/png",
+      filePath: "oversize"
+    )
+    let first = PlatformNativePasteImageItem(
+      mimeType: "image/png",
+      filePath: "first"
+    )
+    let second = PlatformNativePasteImageItem(
+      mimeType: "image/png",
+      filePath: "second"
+    )
+    var attempts: [Int] = []
+    var removed: [String] = []
+    var delivered: [PlatformNativePasteImageItem] = []
+    let coordinator = NativePasteStagingCoordinator(
+      providerCount: 6,
+      maxItemCount: 2,
+      maxItemBytes: 10,
+      maxAggregateBytes: 20,
+      removeItems: { removed.append(contentsOf: $0.map(\.filePath)) },
+      completion: { items, timedOut in
+        XCTAssertFalse(timedOut)
+        delivered = items
+      }
+    )
+
+    coordinator.start { index, _, completion in
+      attempts.append(index)
+      switch index {
+      case 0:
+        completion(nil, 0)
+      case 1:
+        completion(oversize, 11)
+      case 2:
+        completion(first, 6)
+      case 3:
+        completion(nil, 0)
+      case 4:
+        completion(second, 6)
+      default:
+        XCTFail("staging continued after two successful images")
+        completion(nil, 0)
+      }
+    }
+
+    XCTAssertEqual(attempts, [0, 1, 2, 3, 4])
+    XCTAssertEqual(delivered.map(\.filePath), ["first", "second"])
+    XCTAssertEqual(removed, ["oversize"])
+  }
+
+  func testNativePasteTimeoutOwnsAccumulatedAndLateStagedFiles() {
+    let accumulated = PlatformNativePasteImageItem(
+      mimeType: "image/png",
+      filePath: "accumulated"
+    )
+    let late = PlatformNativePasteImageItem(
+      mimeType: "image/png",
+      filePath: "late"
+    )
+    var secondProviderCompletion: ((PlatformNativePasteImageItem?, Int64) -> Void)?
+    var removed: [String] = []
+    var deliveries: [[PlatformNativePasteImageItem]] = []
+    var timeoutFlags: [Bool] = []
+    var timeoutStarted = 0
+    var timeoutDrained = 0
+    let coordinator = NativePasteStagingCoordinator(
+      providerCount: 2,
+      maxItemCount: 2,
+      maxItemBytes: 10,
+      maxAggregateBytes: 20,
+      removeItems: { removed.append(contentsOf: $0.map(\.filePath)) },
+      onTimeoutStarted: { timeoutStarted += 1 },
+      onTimeoutDrained: { timeoutDrained += 1 },
+      completion: { items, timedOut in
+        deliveries.append(items)
+        timeoutFlags.append(timedOut)
+      }
+    )
+
+    coordinator.start { index, _, completion in
+      if index == 0 {
+        completion(accumulated, 4)
+      } else {
+        secondProviderCompletion = completion
+      }
+    }
+    coordinator.timeout()
+    XCTAssertEqual(timeoutStarted, 1)
+    XCTAssertEqual(timeoutDrained, 0)
+    XCTAssertEqual(deliveries.count, 1)
+    XCTAssertEqual(timeoutFlags, [true])
+    secondProviderCompletion?(late, 4)
+    coordinator.timeout()
+
+    XCTAssertEqual(deliveries.count, 1)
+    XCTAssertTrue(deliveries[0].isEmpty)
+    XCTAssertEqual(removed, ["accumulated", "late"])
+    XCTAssertEqual(timeoutStarted, 1)
+    XCTAssertEqual(timeoutDrained, 1)
+  }
+
+  func testAppIntentStagedImageCleanupIsRestrictedToOwnedRoot() throws {
+    let ownedDirectory = FileManager.default.temporaryDirectory
+      .appendingPathComponent("conduit-app-intents", isDirectory: true)
+    try FileManager.default.createDirectory(
+      at: ownedDirectory,
+      withIntermediateDirectories: true
+    )
+    let ownedFile = ownedDirectory.appendingPathComponent(
+      "\(UUID().uuidString)-intent.png"
+    )
+    let outsideFile = FileManager.default.temporaryDirectory
+      .appendingPathComponent("\(UUID().uuidString)-outside.png")
+    defer {
+      try? FileManager.default.removeItem(at: ownedFile)
+      try? FileManager.default.removeItem(at: outsideFile)
+    }
+    try Data([1]).write(to: ownedFile)
+    try Data([2]).write(to: outsideFile)
+
+    AppIntentBridge.removeStagedImageIfOwned(atPath: ownedFile.path)
+    AppIntentBridge.removeStagedImageIfOwned(atPath: outsideFile.path)
+
+    XCTAssertFalse(FileManager.default.fileExists(atPath: ownedFile.path))
+    XCTAssertTrue(FileManager.default.fileExists(atPath: outsideFile.path))
+  }
+
+  func testAppIntentFileBackedImageIsStreamedIntoOwnedStaging() async throws {
+    let source = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "\(UUID().uuidString)-source.png"
+    )
+    let bytes = Data(repeating: 0x5a, count: 512 * 1024)
+    try bytes.write(to: source)
+    defer { try? FileManager.default.removeItem(at: source) }
+
+    let first = try await AppIntentBridge.stageImageArtifact(
+      fileURL: source,
+      filename: "source.png"
+    )
+    let retry = try await AppIntentBridge.stageImageArtifact(
+      fileURL: source,
+      filename: "source.png"
+    )
+    defer {
+      AppIntentBridge.removeStagedImageIfOwned(atPath: first.filePath)
+      AppIntentBridge.removeStagedImageIfOwned(atPath: retry.filePath)
+    }
+
+    XCTAssertEqual(
+      try Data(contentsOf: URL(fileURLWithPath: first.filePath)),
+      bytes
+    )
+    XCTAssertNotEqual(first.filePath, retry.filePath)
+    XCTAssertEqual(first.contentDigest, retry.contentDigest)
+  }
+
+  func testAppIntentFileBackedImageRejectsOversizeBeforeStaging() async throws {
+    let source = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "\(UUID().uuidString)-oversize.png"
+    )
+    XCTAssertTrue(FileManager.default.createFile(atPath: source.path, contents: nil))
+    let handle = try FileHandle(forWritingTo: source)
+    try handle.truncate(atOffset: UInt64(20 * 1024 * 1024 + 1))
+    try handle.close()
+    defer { try? FileManager.default.removeItem(at: source) }
+
+    do {
+      _ = try await AppIntentBridge.stageImage(
+        fileURL: source,
+        filename: "oversize.png"
+      )
+      XCTFail("oversize file was staged")
+    } catch {
+      XCTAssertTrue(error is AppIntentError)
+    }
+  }
+
+  private func nativeShareStatusJSON(
+    id: String,
+    isInProgress: Bool
+  ) throws -> Data {
+    try JSONSerialization.data(withJSONObject: [
+      "id": id,
+      "expectedFileCount": 1,
+      "isInProgress": isInProgress,
+      "errors": [],
+    ])
+  }
+
+  private func nativeShareItemsJSON(_ items: [[String: Any]]) throws -> Data {
+    try JSONSerialization.data(withJSONObject: items)
+  }
+
+  func testShareStagedFilenameFitsFilesystemByteLimitAndPreservesExtension() throws {
+    let importId = UUID().uuidString.lowercased()
+    let itemId = UUID().uuidString.lowercased()
+    let originalName = String(repeating: "界", count: 300) + ".jpeg"
+
+    let filename = try XCTUnwrap(nativeShareStagedFileName(
+      importId: importId,
+      itemId: itemId,
+      ordinal: 11,
+      originalName: originalName,
+      fallbackExtension: "bin"
+    ))
+
+    XCTAssertLessThanOrEqual(
+      filename.utf8.count,
+      nativeShareMaximumFilenameBytes
+    )
+    XCTAssertTrue(filename.hasPrefix("\(importId)-\(itemId)-11-"))
+    XCTAssertTrue(filename.hasSuffix(".jpeg"))
+  }
+
+  func testShareLoadWatchdogScalesWithAdmittedSerialWorkloadAndStaysBounded() {
+    let empty = nativeShareLoadWatchdogInterval(
+      totalItemCount: 0,
+      fileBackedItemCount: 0
+    )
+    let oneFile = nativeShareLoadWatchdogInterval(
+      totalItemCount: 1,
+      fileBackedItemCount: 1
+    )
+    let maximumWorkload = nativeShareLoadWatchdogInterval(
+      totalItemCount: nativeShareMaximumItemCount,
+      fileBackedItemCount: 6
+    )
+    let untrustedCounts = nativeShareLoadWatchdogInterval(
+      totalItemCount: .max,
+      fileBackedItemCount: .max
+    )
+
+    XCTAssertEqual(empty, 20)
+    XCTAssertGreaterThan(oneFile, empty)
+    XCTAssertGreaterThan(maximumWorkload, oneFile)
+    XCTAssertLessThanOrEqual(maximumWorkload, 120)
+    XCTAssertEqual(untrustedCounts, maximumWorkload)
+  }
+
+  func testShareContentTypeSkipsFileURLStandInsForTheFilesOwnType() {
+    // Files registers the document's type next to its URL. Loading the URL
+    // type as a file staged a "file URL.dat" plist instead of the PDF.
+    XCTAssertEqual(
+      nativeShareContentTypeIdentifier(
+        registeredTypeIdentifiers: [
+          "com.adobe.pdf",
+          "public.file-url",
+          "public.url",
+        ],
+        conformingTo: .data
+      ),
+      "com.adobe.pdf"
+    )
+    XCTAssertNil(nativeShareContentTypeIdentifier(
+      registeredTypeIdentifiers: ["public.file-url", "public.url"],
+      conformingTo: .data
+    ))
+    // `com.apple.uikit.image` is the object, not an image format.
+    XCTAssertEqual(
+      nativeShareContentTypeIdentifier(
+        registeredTypeIdentifiers: [
+          "com.apple.uikit.image",
+          "public.heic",
+          "public.png",
+        ],
+        conformingTo: .image
+      ),
+      "public.heic"
+    )
+    XCTAssertNil(nativeShareContentTypeIdentifier(
+      registeredTypeIdentifiers: ["com.adobe.pdf"],
+      conformingTo: .image
+    ))
+  }
+
+  func testShareContentTypeLoadsTheDocumentBytesAndName() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "native-share-pdf-\(UUID().uuidString)",
+      isDirectory: true
+    )
+    try FileManager.default.createDirectory(
+      at: directory,
+      withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let pdfURL = directory.appendingPathComponent("Report.pdf")
+    let pdf = UIGraphicsPDFRenderer(
+      bounds: CGRect(x: 0, y: 0, width: 100, height: 100)
+    ).pdfData { context in context.beginPage() }
+    try pdf.write(to: pdfURL)
+    let provider = try XCTUnwrap(NSItemProvider(contentsOf: pdfURL))
+
+    let identifier = try XCTUnwrap(nativeShareContentTypeIdentifier(
+      registeredTypeIdentifiers: provider.registeredTypeIdentifiers,
+      conformingTo: .data
+    ))
+    let loaded = expectation(description: "file representation")
+    var loadedName: String?
+    var loadedBytes: Data?
+    provider.loadFileRepresentation(forTypeIdentifier: identifier) { url, _ in
+      loadedName = url?.lastPathComponent
+      loadedBytes = url.flatMap { try? Data(contentsOf: $0) }
+      loaded.fulfill()
+    }
+    let referenced = expectation(description: "file URL")
+    var referencedName: String?
+    _ = provider.loadObject(ofClass: URL.self) { url, _ in
+      referencedName = url?.lastPathComponent
+      referenced.fulfill()
+    }
+    wait(for: [loaded, referenced], timeout: 10)
+
+    XCTAssertEqual(loadedBytes, pdf)
+    XCTAssertNil(nativeShareImageType(of: pdf))
+    XCTAssertEqual(
+      nativeShareSourceFileName(
+        loadedName: try XCTUnwrap(loadedName),
+        preferredName: referencedName
+      ),
+      "Report.pdf"
+    )
+  }
+
+  func testShareSourceFileNameKeepsTheSendersNameWithTheLoadedExtension() {
+    XCTAssertEqual(
+      nativeShareSourceFileName(
+        loadedName: "PDF document.pdf",
+        preferredName: "Report.PDF"
+      ),
+      "Report.PDF"
+    )
+    XCTAssertEqual(
+      nativeShareSourceFileName(
+        loadedName: "PDF document.pdf",
+        preferredName: nil
+      ),
+      "PDF document.pdf"
+    )
+    XCTAssertEqual(
+      nativeShareSourceFileName(
+        loadedName: "HEIF Image.heic",
+        preferredName: "IMG_0001"
+      ),
+      "IMG_0001.heic"
+    )
+    XCTAssertEqual(
+      nativeShareSourceFileName(
+        loadedName: "JPEG image.jpeg",
+        preferredName: "photo.jpg"
+      ),
+      "photo.jpg"
+    )
+    // The name must describe the bytes that were loaded, not the original.
+    XCTAssertEqual(
+      nativeShareSourceFileName(
+        loadedName: "JPEG image.jpeg",
+        preferredName: "photo.HEIC"
+      ),
+      "photo.HEIC.jpeg"
+    )
+    XCTAssertEqual(
+      nativeShareSourceFileName(
+        loadedName: "PNG image.png",
+        preferredName: "Screenshot at 10.16.42"
+      ),
+      "Screenshot at 10.16.42.png"
+    )
+  }
+
+  func testShareEncodesOnlyInMemoryImagesWithinThePixelBudget() {
+    // The largest iPad screenshot, landscape.
+    XCTAssertTrue(nativeShareImageFitsEncodingBudget(
+      pixelWidth: 2752,
+      pixelHeight: 2064
+    ))
+    XCTAssertTrue(nativeShareImageFitsEncodingBudget(
+      pixelWidth: 4096,
+      pixelHeight: 4096
+    ))
+    XCTAssertFalse(nativeShareImageFitsEncodingBudget(
+      pixelWidth: 4097,
+      pixelHeight: 4096
+    ))
+    // A 48 MP photo would need about 195 MB of decoded pixels.
+    XCTAssertFalse(nativeShareImageFitsEncodingBudget(
+      pixelWidth: 8064,
+      pixelHeight: 6048
+    ))
+    XCTAssertFalse(nativeShareImageFitsEncodingBudget(
+      pixelWidth: 0,
+      pixelHeight: 4096
+    ))
+  }
+
+  func testShareDetectsAnArchivedInMemoryImageAndEncodesTheObject() throws {
+    let image = UIGraphicsImageRenderer(
+      size: CGSize(width: 40, height: 30)
+    ).image { context in
+      UIColor.red.setFill()
+      context.fill(CGRect(x: 0, y: 0, width: 40, height: 30))
+    }
+    // The screenshot editor shares a UIImage object under an image type.
+    let provider = NSItemProvider(
+      item: image,
+      typeIdentifier: UTType.png.identifier
+    )
+
+    let loaded = expectation(description: "file representation")
+    var loadedName: String?
+    var loadedIsArchive = false
+    provider.loadFileRepresentation(
+      forTypeIdentifier: UTType.png.identifier
+    ) { url, _ in
+      loadedName = url?.lastPathComponent
+      loadedIsArchive = url.map(nativeShareFileIsArchivedObject(at:)) ?? false
+      loaded.fulfill()
+    }
+    let item = expectation(description: "item")
+    var loadedItem: NSSecureCoding?
+    provider.loadItem(forTypeIdentifier: UTType.png.identifier) { value, _ in
+      loadedItem = value
+      item.fulfill()
+    }
+    wait(for: [loaded, item], timeout: 10)
+
+    XCTAssertEqual(
+      (try XCTUnwrap(loadedName) as NSString).pathExtension,
+      "png"
+    )
+    XCTAssertTrue(loadedIsArchive)
+    let object = try XCTUnwrap(loadedItem as? UIImage)
+    let png = try XCTUnwrap(nativeShareEncodedImage(
+      object,
+      typeIdentifier: UTType.png.identifier
+    ))
+    XCTAssertEqual(png.fileExtension, "png")
+    XCTAssertEqual(nativeShareImageType(of: png.data), .png)
+    let jpeg = try XCTUnwrap(nativeShareEncodedImage(
+      object,
+      typeIdentifier: UTType.jpeg.identifier
+    ))
+    XCTAssertEqual(jpeg.fileExtension, "jpg")
+    XCTAssertEqual(nativeShareImageType(of: jpeg.data), .jpeg)
+    XCTAssertNil(nativeShareImageType(of: Data("not an image".utf8)))
+
+    // Real files stay on the file path, including formats ImageIO can't read.
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "native-share-archive-\(UUID().uuidString)",
+      isDirectory: true
+    )
+    try FileManager.default.createDirectory(
+      at: directory,
+      withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let pngURL = directory.appendingPathComponent("photo.png")
+    try png.data.write(to: pngURL)
+    let svgURL = directory.appendingPathComponent("logo.svg")
+    try Data("<svg xmlns=\"http://www.w3.org/2000/svg\"/>".utf8)
+      .write(to: svgURL)
+    XCTAssertFalse(nativeShareFileIsArchivedObject(at: pngURL))
+    XCTAssertFalse(nativeShareFileIsArchivedObject(at: svgURL))
+  }
+
+  func testShareLoneLinkIsASingleWebAddressWithoutAPageTitle() throws {
+    let imageURL = try XCTUnwrap(URL(string: "https://example.com/a.png"))
+    func link() -> NSItemProvider {
+      NSItemProvider(item: imageURL as NSURL, typeIdentifier: "public.url")
+    }
+    func item(
+      _ providers: [NSItemProvider],
+      contentText: String? = nil
+    ) -> NSExtensionItem {
+      let item = NSExtensionItem()
+      item.attachments = providers
+      item.attributedContentText = contentText.map(NSAttributedString.init)
+      return item
+    }
+
+    // Safari's long-press Share on an image.
+    let safariImage = link()
+    XCTAssertTrue(
+      nativeShareLoneLinkProvider(in: [item([safariImage])]) === safariImage
+    )
+    XCTAssertNotNil(
+      nativeShareLoneLinkProvider(in: [item([link()], contentText: " \n")])
+    )
+    // A page share carries the page title next to its address.
+    XCTAssertNil(nativeShareLoneLinkProvider(
+      in: [item([link()], contentText: "Safari share test")]
+    ))
+    let titled = item([link()])
+    titled.attributedTitle = NSAttributedString(string: "Photos")
+    XCTAssertNil(nativeShareLoneLinkProvider(in: [titled]))
+    XCTAssertNil(nativeShareLoneLinkProvider(in: [item([link(), link()])]))
+    XCTAssertNil(nativeShareLoneLinkProvider(
+      in: [item([link()]), item([link()])]
+    ))
+    XCTAssertNil(nativeShareLoneLinkProvider(in: []))
+
+    let withText = link()
+    withText.registerItem(forTypeIdentifier: "public.plain-text") {
+      completion, _, _ in
+      completion?("A caption" as NSString, nil)
+    }
+    XCTAssertNil(nativeShareLoneLinkProvider(in: [item([withText])]))
+    let file = NSItemProvider(
+      item: URL(fileURLWithPath: "/tmp/a.png") as NSURL,
+      typeIdentifier: "public.file-url"
+    )
+    XCTAssertNil(nativeShareLoneLinkProvider(in: [item([file])]))
+    let image = NSItemProvider(
+      item: Data() as NSData,
+      typeIdentifier: UTType.png.identifier
+    )
+    XCTAssertNil(nativeShareLoneLinkProvider(in: [item([image])]))
+  }
+
+  func testShareLinkedImageQualifiesOnlyHttpsAddressesOfImageFiles() {
+    func qualifies(_ address: String) -> Bool {
+      URL(string: address).map(nativeShareLinkedImageQualifies) ?? false
+    }
+
+    XCTAssertTrue(qualifies("https://upload.wikimedia.org/a/b/Photo.png"))
+    XCTAssertTrue(qualifies("https://example.com/photo.JPG?w=800#top"))
+    XCTAssertTrue(qualifies("https://example.com/photo.jpeg"))
+    XCTAssertTrue(qualifies("https://example.com/loop.gif"))
+    XCTAssertTrue(qualifies("https://example.com/photo.webp"))
+    XCTAssertTrue(qualifies("HTTPS://example.com/IMG_0001.HEIC"))
+
+    XCTAssertFalse(qualifies("http://example.com/photo.png"))
+    XCTAssertFalse(qualifies("https://example.com/index.html"))
+    XCTAssertFalse(qualifies("https://example.com/image"))
+    XCTAssertFalse(qualifies("https://example.com/logo.svg"))
+    XCTAssertFalse(qualifies("https://example.com/photo.png.html"))
+    // Only the path counts, not the query.
+    XCTAssertFalse(qualifies("https://example.com/view?file=photo.png"))
+    XCTAssertFalse(qualifies("https:///photo.png"))
+    XCTAssertFalse(qualifies("file:///tmp/photo.png"))
+    XCTAssertFalse(qualifies("data:image/png;base64,iVBORw0KGgo="))
+  }
+
+  func testShareLinkedImageRedirectsStayOnHttpsAndStopAfterFive() {
+    let https = URL(string: "https://cdn.example.com/photo.png")
+    let http = URL(string: "http://cdn.example.com/photo.png")
+
+    XCTAssertTrue(
+      nativeShareLinkedImageRedirectAllowed(to: https, redirectCount: 1)
+    )
+    XCTAssertTrue(
+      nativeShareLinkedImageRedirectAllowed(to: https, redirectCount: 5)
+    )
+    XCTAssertFalse(
+      nativeShareLinkedImageRedirectAllowed(to: https, redirectCount: 6)
+    )
+    XCTAssertFalse(
+      nativeShareLinkedImageRedirectAllowed(to: http, redirectCount: 1)
+    )
+    XCTAssertFalse(
+      nativeShareLinkedImageRedirectAllowed(to: nil, redirectCount: 1)
+    )
+  }
+
+  func testShareLinkedImageFitsTheImageAllowance() {
+    let limit: Int64 = 20 * 1024 * 1024
+
+    // No Content-Length: the bytes are counted as they arrive.
+    XCTAssertTrue(
+      nativeShareLinkedImageFits(byteCount: -1, allowedBytes: limit)
+    )
+    XCTAssertTrue(
+      nativeShareLinkedImageFits(byteCount: limit, allowedBytes: limit)
+    )
+    XCTAssertFalse(
+      nativeShareLinkedImageFits(byteCount: limit + 1, allowedBytes: limit)
+    )
+    XCTAssertFalse(nativeShareLinkedImageFits(byteCount: 1, allowedBytes: 0))
+  }
+
+  func testShareLinkedImageResponseNeedsSuccessAndAnImageType() {
+    XCTAssertTrue(nativeShareLinkedImageResponseAcceptable(
+      statusCode: 200,
+      mimeType: "image/png"
+    ))
+    XCTAssertTrue(nativeShareLinkedImageResponseAcceptable(
+      statusCode: 203,
+      mimeType: "IMAGE/WEBP"
+    ))
+    XCTAssertFalse(nativeShareLinkedImageResponseAcceptable(
+      statusCode: 302,
+      mimeType: "image/png"
+    ))
+    XCTAssertFalse(nativeShareLinkedImageResponseAcceptable(
+      statusCode: 403,
+      mimeType: "image/png"
+    ))
+    // A /wiki/File:Photo.png page.
+    XCTAssertFalse(nativeShareLinkedImageResponseAcceptable(
+      statusCode: 200,
+      mimeType: "text/html"
+    ))
+    XCTAssertFalse(nativeShareLinkedImageResponseAcceptable(
+      statusCode: 200,
+      mimeType: "application/octet-stream"
+    ))
+    XCTAssertFalse(nativeShareLinkedImageResponseAcceptable(
+      statusCode: 200,
+      mimeType: nil
+    ))
+  }
+
+  func testShareDownloadedImageTypeComesFromTheBytes() throws {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "native-share-linked-type-\(UUID().uuidString)",
+      isDirectory: true
+    )
+    try FileManager.default.createDirectory(
+      at: directory,
+      withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let image = linkedImageTestImage()
+    let png = directory.appendingPathComponent("png")
+    try XCTUnwrap(image.pngData()).write(to: png)
+    let jpeg = directory.appendingPathComponent("jpeg")
+    try XCTUnwrap(image.jpegData(compressionQuality: 0.8)).write(to: jpeg)
+    let html = directory.appendingPathComponent("File:Photo.png")
+    try Data("<!doctype html><title>File:Photo.png</title>".utf8)
+      .write(to: html)
+    let empty = directory.appendingPathComponent("empty")
+    try Data().write(to: empty)
+
+    XCTAssertEqual(nativeShareDownloadedImageType(at: png), .png)
+    XCTAssertEqual(nativeShareDownloadedImageType(at: jpeg), .jpeg)
+    XCTAssertNil(nativeShareDownloadedImageType(at: html))
+    XCTAssertNil(nativeShareDownloadedImageType(at: empty))
+    XCTAssertNil(nativeShareDownloadedImageType(
+      at: directory.appendingPathComponent("missing")
+    ))
+  }
+
+  func testShareLinkedImageSessionKeepsNoCookiesCacheOrCredentials() {
+    let configuration = NativeShareLinkedImageDownload.sessionConfiguration()
+
+    XCTAssertNil(configuration.httpCookieStorage)
+    XCTAssertFalse(configuration.httpShouldSetCookies)
+    XCTAssertEqual(configuration.httpCookieAcceptPolicy, .never)
+    XCTAssertNil(configuration.urlCredentialStorage)
+    XCTAssertNil(configuration.urlCache)
+    XCTAssertEqual(configuration.timeoutIntervalForRequest, 10)
+    XCTAssertEqual(configuration.timeoutIntervalForResource, 15)
+  }
+
+  func testShareLinkedImageDownloadKeepsOnlyARealImage() throws {
+    let png = try XCTUnwrap(linkedImageTestImage().pngData())
+    let photo = "https://images.example.com/photo.png"
+    LinkedImageStubProtocol.replies = [
+      photo: .init(mimeType: "image/png", body: png),
+      "http://images.example.com/photo.png": .init(
+        mimeType: "image/png",
+        body: png
+      ),
+      "https://example.com/moved.png": .init(redirect: photo),
+      "https://example.com/insecure.png": .init(
+        redirect: "http://images.example.com/photo.png"
+      ),
+      "https://example.com/untyped.png": .init(
+        mimeType: "application/octet-stream",
+        body: png
+      ),
+      "https://example.com/wiki/File:Photo.png": .init(
+        mimeType: "text/html",
+        body: Data("<!doctype html>".utf8)
+      ),
+      "https://example.com/mislabelled.png": .init(
+        mimeType: "image/png",
+        body: Data("<!doctype html>".utf8)
+      ),
+      "https://example.com/gone.png": .init(
+        status: 404,
+        mimeType: "image/png",
+        body: png
+      ),
+    ]
+    for hop in 1...6 {
+      LinkedImageStubProtocol.replies["https://example.com/hop\(hop).png"] =
+        .init(
+          redirect: hop == 1 ? photo : "https://example.com/hop\(hop - 1).png"
+        )
+    }
+
+    let result = try XCTUnwrap(linkedImageDownload(photo))
+    XCTAssertEqual(result.type, .png)
+    XCTAssertEqual(try Data(contentsOf: result.fileURL), png)
+    XCTAssertNotNil(linkedImageDownload("https://example.com/moved.png"))
+    XCTAssertNotNil(linkedImageDownload("https://example.com/hop5.png"))
+
+    XCTAssertNil(linkedImageDownload("https://example.com/hop6.png"))
+    XCTAssertNil(linkedImageDownload("https://example.com/insecure.png"))
+    XCTAssertNil(linkedImageDownload("https://example.com/untyped.png"))
+    XCTAssertNil(
+      linkedImageDownload("https://example.com/wiki/File:Photo.png")
+    )
+    XCTAssertNil(linkedImageDownload("https://example.com/mislabelled.png"))
+    XCTAssertNil(linkedImageDownload("https://example.com/gone.png"))
+  }
+
+  func testShareLinkedImageDownloadStopsAtTheSizeLimit() throws {
+    let png = try XCTUnwrap(linkedImageTestImage().pngData())
+    let allowance = Int64(png.count)
+    let declared = "https://example.com/declared.png"
+    let oversized = "https://example.com/oversized.png"
+    let undeclared = "https://example.com/undeclared.png"
+    LinkedImageStubProtocol.replies = [
+      declared: .init(mimeType: "image/png", body: png, length: allowance),
+      // Refused on the Content-Length alone, before any of the body.
+      oversized: .init(
+        mimeType: "image/png",
+        body: png,
+        length: allowance + 1
+      ),
+      undeclared: .init(mimeType: "image/png", body: png),
+    ]
+
+    XCTAssertNotNil(linkedImageDownload(declared, allowedBytes: allowance))
+    XCTAssertNotNil(linkedImageDownload(undeclared, allowedBytes: allowance))
+    XCTAssertNil(linkedImageDownload(oversized, allowedBytes: allowance))
+    // Without a Content-Length, the bytes are counted as they arrive.
+    XCTAssertNil(linkedImageDownload(undeclared, allowedBytes: allowance - 1))
+  }
+
+  private func linkedImageTestImage() -> UIImage {
+    UIGraphicsImageRenderer(
+      size: CGSize(width: 24, height: 16)
+    ).image { context in
+      UIColor.blue.setFill()
+      context.fill(CGRect(x: 0, y: 0, width: 24, height: 16))
+    }
+  }
+
+  private func linkedImageDownload(
+    _ address: String,
+    allowedBytes: Int64 = 20 * 1024 * 1024
+  ) -> NativeShareLinkedImageDownload.Result? {
+    guard let url = URL(string: address) else { return nil }
+    let configuration = NativeShareLinkedImageDownload.sessionConfiguration()
+    configuration.protocolClasses = [LinkedImageStubProtocol.self]
+    let download = NativeShareLinkedImageDownload(
+      url: url,
+      allowedBytes: allowedBytes,
+      configuration: configuration
+    )
+    let finished = expectation(description: "download \(address)")
+    var result: NativeShareLinkedImageDownload.Result?
+    download.start { value in
+      result = value
+      finished.fulfill()
+    }
+    wait(for: [finished], timeout: 10)
+    if let result {
+      addTeardownBlock { download.removeFile() }
+      XCTAssertTrue(FileManager.default.fileExists(atPath: result.fileURL.path))
+    }
+    return result
+  }
+
+  func testShareEnvelopeRejectsAStagedFileFromAnotherImportId() throws {
+    let container = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "native-share-cross-import-file-\(UUID().uuidString)",
+      isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: container) }
+    let staging = container.appendingPathComponent(
+      nativeShareStagingDirectoryName,
+      isDirectory: true
+    )
+    try FileManager.default.createDirectory(
+      at: staging,
+      withIntermediateDirectories: true
+    )
+    let currentId = UUID().uuidString.lowercased()
+    let otherId = UUID().uuidString.lowercased()
+    let otherFile = staging.appendingPathComponent(
+      "\(otherId)-\(UUID().uuidString.lowercased())-0-image.png"
+    )
+    try Data([1, 2, 3]).write(to: otherFile)
+    let store = NativeShareEnvelopeStore(containerURL: container)
+    try store.beginImport(
+      id: currentId,
+      statusJSON: nativeShareStatusJSON(id: currentId, isInProgress: true)
+    )
+
+    XCTAssertThrowsError(try store.publish(
+      id: currentId,
+      itemsJSON: nativeShareItemsJSON([
+        ["type": 2, "value": otherFile.absoluteString],
+      ]),
+      message: nil,
+      statusJSON: nativeShareStatusJSON(id: currentId, isInProgress: false)
+    ))
+    XCTAssertTrue(FileManager.default.fileExists(atPath: otherFile.path))
+    XCTAssertNil(try store.takeCurrent())
+  }
+
+  func testShareEnvelopeNewImportRecoversMalformedStatusPointerOnly() throws {
+    let container = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "native-share-malformed-status-\(UUID().uuidString)",
+      isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: container) }
+    let storage = container.appendingPathComponent(
+      "conduit-share-envelopes-v1",
+      isDirectory: true
+    )
+    let staging = container.appendingPathComponent(
+      nativeShareStagingDirectoryName,
+      isDirectory: true
+    )
+    try FileManager.default.createDirectory(
+      at: storage,
+      withIntermediateDirectories: true
+    )
+    try FileManager.default.createDirectory(
+      at: staging,
+      withIntermediateDirectories: true
+    )
+    let orphanId = UUID().uuidString.lowercased()
+    let orphan = staging.appendingPathComponent(
+      "\(orphanId)-\(UUID().uuidString.lowercased())-0-orphan.png"
+    )
+    try Data([9]).write(to: orphan)
+    let statusURL = storage.appendingPathComponent("current-status.json")
+    let malformedStatuses = [
+      Data("not-json".utf8),
+      Data(repeating: 0x61, count: 256 * 1024 + 1),
+      try JSONSerialization.data(withJSONObject: [
+        "id": "not-a-uuid",
+        "isInProgress": true,
+      ]),
+      try JSONSerialization.data(withJSONObject: [
+        "id": UUID().uuidString.lowercased(),
+        "isInProgress": "yes",
+      ]),
+    ]
+    let store = NativeShareEnvelopeStore(containerURL: container)
+
+    for malformed in malformedStatuses {
+      try malformed.write(to: statusURL, options: .atomic)
+      let replacementId = UUID().uuidString.lowercased()
+      try store.beginImport(
+        id: replacementId,
+        statusJSON: nativeShareStatusJSON(
+          id: replacementId,
+          isInProgress: true
+        )
+      )
+      let current = try XCTUnwrap(store.currentStatusJSON())
+      let value = try XCTUnwrap(
+        try JSONSerialization.jsonObject(with: current) as? [String: Any]
+      )
+      XCTAssertEqual(value["id"] as? String, replacementId)
+    }
+
+    XCTAssertTrue(FileManager.default.fileExists(atPath: orphan.path))
+  }
+
+  func testShareEnvelopeAcceptsMaximumAggregateTextPayload() throws {
+    let container = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "native-share-maximum-text-\(UUID().uuidString)",
+      isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: container) }
+    let importId = UUID().uuidString.lowercased()
+    let value = String(
+      repeating: "a",
+      count: nativeShareMaximumTextBytes
+    )
+    let items = try nativeShareItemsJSON((0..<nativeShareMaximumItemCount).map {
+      _ in ["type": 0, "value": value]
+    })
+    XCTAssertGreaterThan(items.count, 2 * 1024 * 1024)
+    XCTAssertGreaterThan(
+      items.count,
+      nativeShareMaximumAggregateTextBytes
+    )
+
+    let store = NativeShareEnvelopeStore(containerURL: container)
+    try store.beginImport(
+      id: importId,
+      statusJSON: nativeShareStatusJSON(id: importId, isInProgress: true)
+    )
+    XCTAssertTrue(try store.publish(
+      id: importId,
+      itemsJSON: items,
+      message: nil,
+      statusJSON: nativeShareStatusJSON(id: importId, isInProgress: false)
+    ))
+    XCTAssertEqual(try store.takeCurrent()?.envelope.itemsJSON, items)
+  }
+
+  func testShareEnvelopeRejectsTextBeyondAggregateLimit() throws {
+    let container = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "native-share-over-aggregate-text-\(UUID().uuidString)",
+      isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: container) }
+    let importId = UUID().uuidString.lowercased()
+    let value = String(
+      repeating: "a",
+      count: nativeShareMaximumTextBytes
+    )
+    var payload = (0..<nativeShareMaximumItemCount).map {
+      _ in ["type": 0 as Any, "value": value as Any]
+    }
+    payload[0]["message"] = "x"
+
+    let store = NativeShareEnvelopeStore(containerURL: container)
+    try store.beginImport(
+      id: importId,
+      statusJSON: nativeShareStatusJSON(id: importId, isInProgress: true)
+    )
+    XCTAssertThrowsError(try store.publish(
+      id: importId,
+      itemsJSON: nativeShareItemsJSON(payload),
+      message: nil,
+      statusJSON: nativeShareStatusJSON(id: importId, isInProgress: false)
+    ))
+  }
+
+  func testShareEnvelopeTakeAndAcknowledgementAreExactIdAndIdempotent() throws {
+    let container = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "native-share-envelope-\(UUID().uuidString)",
+      isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: container) }
+    try FileManager.default.createDirectory(
+      at: container,
+      withIntermediateDirectories: true
+    )
+    let store = NativeShareEnvelopeStore(containerURL: container)
+    let firstId = UUID().uuidString.lowercased()
+    let secondId = UUID().uuidString.lowercased()
+    let firstItems = try nativeShareItemsJSON([
+      ["type": 0, "value": "first"],
+    ])
+
+    try store.beginImport(
+      id: firstId,
+      statusJSON: nativeShareStatusJSON(id: firstId, isInProgress: true)
+    )
+    XCTAssertTrue(try store.publish(
+      id: firstId,
+      itemsJSON: firstItems,
+      message: nil,
+      statusJSON: nativeShareStatusJSON(id: firstId, isInProgress: false)
+    ))
+    XCTAssertEqual(try store.takeCurrent()?.envelope.id, firstId)
+    XCTAssertTrue(try store.acknowledge(id: firstId))
+    XCTAssertTrue(try store.acknowledge(id: firstId))
+
+    try store.beginImport(
+      id: secondId,
+      statusJSON: nativeShareStatusJSON(id: secondId, isInProgress: true)
+    )
+    XCTAssertFalse(try store.acknowledge(id: firstId))
+    XCTAssertNil(try store.takeCurrent())
+    let currentStatus = try XCTUnwrap(store.currentStatusJSON())
+    let currentMap = try XCTUnwrap(
+      try JSONSerialization.jsonObject(with: currentStatus) as? [String: Any]
+    )
+    XCTAssertEqual(currentMap["id"] as? String, secondId)
+  }
+
+  func testShareEnvelopeSupersedeCleansOnlyPriorOwnedStagingFiles() throws {
+    let container = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "native-share-cleanup-\(UUID().uuidString)",
+      isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: container) }
+    let staging = container.appendingPathComponent(
+      nativeShareStagingDirectoryName,
+      isDirectory: true
+    )
+    try FileManager.default.createDirectory(
+      at: staging,
+      withIntermediateDirectories: true
+    )
+    let firstId = UUID().uuidString.lowercased()
+    let secondId = UUID().uuidString.lowercased()
+    let owned = staging.appendingPathComponent(
+      "\(firstId)-\(UUID().uuidString.lowercased())-0-image.png"
+    )
+    let unrelated = staging.appendingPathComponent(
+      "\(UUID().uuidString.lowercased())-0-unrelated.png"
+    )
+    try Data([1, 2, 3]).write(to: owned)
+    try Data([9]).write(to: unrelated)
+    let store = NativeShareEnvelopeStore(containerURL: container)
+
+    try store.beginImport(
+      id: firstId,
+      statusJSON: nativeShareStatusJSON(id: firstId, isInProgress: true)
+    )
+    XCTAssertTrue(try store.publish(
+      id: firstId,
+      itemsJSON: nativeShareItemsJSON([
+        ["type": 2, "value": owned.absoluteString],
+      ]),
+      message: nil,
+      statusJSON: nativeShareStatusJSON(id: firstId, isInProgress: false)
+    ))
+
+    try store.beginImport(
+      id: secondId,
+      statusJSON: nativeShareStatusJSON(id: secondId, isInProgress: true)
+    )
+
+    XCTAssertFalse(FileManager.default.fileExists(atPath: owned.path))
+    XCTAssertTrue(FileManager.default.fileExists(atPath: unrelated.path))
+    XCTAssertFalse(try store.acknowledge(id: firstId))
+  }
+
+  func testShareEnvelopeAcknowledgementTransfersStagedFileOwnership() throws {
+    let container = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "native-share-transfer-\(UUID().uuidString)",
+      isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: container) }
+    let staging = container.appendingPathComponent(
+      nativeShareStagingDirectoryName,
+      isDirectory: true
+    )
+    try FileManager.default.createDirectory(
+      at: staging,
+      withIntermediateDirectories: true
+    )
+    let firstId = UUID().uuidString.lowercased()
+    let secondId = UUID().uuidString.lowercased()
+    let owned = staging.appendingPathComponent(
+      "\(firstId)-\(UUID().uuidString.lowercased())-0-image.png"
+    )
+    try Data([1]).write(to: owned)
+    let store = NativeShareEnvelopeStore(containerURL: container)
+    try store.beginImport(
+      id: firstId,
+      statusJSON: nativeShareStatusJSON(id: firstId, isInProgress: true)
+    )
+    XCTAssertTrue(try store.publish(
+      id: firstId,
+      itemsJSON: nativeShareItemsJSON([
+        ["type": 2, "value": owned.absoluteString],
+      ]),
+      message: nil,
+      statusJSON: nativeShareStatusJSON(id: firstId, isInProgress: false)
+    ))
+    XCTAssertTrue(try store.acknowledge(id: firstId))
+
+    try store.beginImport(
+      id: secondId,
+      statusJSON: nativeShareStatusJSON(id: secondId, isInProgress: true)
+    )
+
+    XCTAssertTrue(FileManager.default.fileExists(atPath: owned.path))
+  }
+
+  func testShareEnvelopeFailedSupersedeRetainsDartOwnershipMarker() throws {
+    enum InjectedFailure: Error { case statusWrite }
+
+    let container = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "native-share-failed-supersede-\(UUID().uuidString)",
+      isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: container) }
+    let staging = container.appendingPathComponent(
+      nativeShareStagingDirectoryName,
+      isDirectory: true
+    )
+    try FileManager.default.createDirectory(
+      at: staging,
+      withIntermediateDirectories: true
+    )
+    let firstId = UUID().uuidString.lowercased()
+    let secondId = UUID().uuidString.lowercased()
+    let owned = staging.appendingPathComponent(
+      "\(firstId)-\(UUID().uuidString.lowercased())-0-image.png"
+    )
+    try Data([1, 2, 3]).write(to: owned)
+    let store = NativeShareEnvelopeStore(containerURL: container)
+    try store.beginImport(
+      id: firstId,
+      statusJSON: nativeShareStatusJSON(id: firstId, isInProgress: true)
+    )
+    XCTAssertTrue(try store.publish(
+      id: firstId,
+      itemsJSON: nativeShareItemsJSON([
+        ["type": 2, "value": owned.absoluteString],
+      ]),
+      message: nil,
+      statusJSON: nativeShareStatusJSON(id: firstId, isInProgress: false)
+    ))
+    XCTAssertTrue(try store.acknowledge(id: firstId))
+
+    let failingStore = NativeShareEnvelopeStore(
+      containerURL: container,
+      statusWriteOverrideForTesting: { _, _ in
+        throw InjectedFailure.statusWrite
+      }
+    )
+    XCTAssertThrowsError(try failingStore.beginImport(
+      id: secondId,
+      statusJSON: nativeShareStatusJSON(id: secondId, isInProgress: true)
+    ))
+
+    XCTAssertTrue(try store.acknowledge(id: firstId))
+    XCTAssertNil(try store.takeCurrent())
+    XCTAssertTrue(FileManager.default.fileExists(atPath: owned.path))
+
+    try store.beginImport(
+      id: secondId,
+      statusJSON: nativeShareStatusJSON(id: secondId, isInProgress: true)
+    )
+    XCTAssertTrue(FileManager.default.fileExists(atPath: owned.path))
+    XCTAssertFalse(try store.acknowledge(id: firstId))
+  }
+
+  func testShareEnvelopePublishFailureRemovesCrashLeftEnvelopeBeforeCleanup() throws {
+    enum InjectedFailure: Error { case statusWrite }
+
+    let container = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "native-share-failed-publish-\(UUID().uuidString)",
+      isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: container) }
+    let staging = container.appendingPathComponent(
+      nativeShareStagingDirectoryName,
+      isDirectory: true
+    )
+    try FileManager.default.createDirectory(
+      at: staging,
+      withIntermediateDirectories: true
+    )
+    let importId = UUID().uuidString.lowercased()
+    let owned = staging.appendingPathComponent(
+      "\(importId)-\(UUID().uuidString.lowercased())-0-image.png"
+    )
+    try Data([4, 5, 6]).write(to: owned)
+    let itemsJSON = try nativeShareItemsJSON([
+      ["type": 2, "value": owned.absoluteString],
+    ])
+    let store = NativeShareEnvelopeStore(containerURL: container)
+    try store.beginImport(
+      id: importId,
+      statusJSON: nativeShareStatusJSON(id: importId, isInProgress: true)
+    )
+
+    // Model a process exit after the immutable envelope rename but before the
+    // terminal status rename.
+    let storage = container.appendingPathComponent(
+      "conduit-share-envelopes-v1",
+      isDirectory: true
+    )
+    let envelopeURL = storage.appendingPathComponent(
+      "payload-\(importId).plist"
+    )
+    let crashLeftEnvelope = NativeSharePayloadEnvelope(
+      id: importId,
+      itemsJSON: itemsJSON,
+      message: nil
+    )
+    try PropertyListEncoder().encode(crashLeftEnvelope).write(to: envelopeURL)
+
+    let failingStore = NativeShareEnvelopeStore(
+      containerURL: container,
+      statusWriteOverrideForTesting: { _, _ in
+        throw InjectedFailure.statusWrite
+      }
+    )
+    XCTAssertThrowsError(try failingStore.publish(
+      id: importId,
+      itemsJSON: itemsJSON,
+      message: nil,
+      statusJSON: nativeShareStatusJSON(id: importId, isInProgress: false)
+    ))
+
+    XCTAssertFalse(FileManager.default.fileExists(atPath: envelopeURL.path))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: owned.path))
+    XCTAssertNil(try store.takeCurrent())
+  }
+
+  func testShareEnvelopeAcknowledgedClearRequiresExactIdAndPreservesFiles() throws {
+    let container = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "native-share-acknowledged-clear-\(UUID().uuidString)",
+      isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: container) }
+    let staging = container.appendingPathComponent(
+      nativeShareStagingDirectoryName,
+      isDirectory: true
+    )
+    try FileManager.default.createDirectory(
+      at: staging,
+      withIntermediateDirectories: true
+    )
+    let importId = UUID().uuidString.lowercased()
+    let owned = staging.appendingPathComponent(
+      "\(importId)-\(UUID().uuidString.lowercased())-0-image.png"
+    )
+    try Data([7]).write(to: owned)
+    let store = NativeShareEnvelopeStore(containerURL: container)
+    try store.beginImport(
+      id: importId,
+      statusJSON: nativeShareStatusJSON(id: importId, isInProgress: true)
+    )
+    XCTAssertTrue(try store.publish(
+      id: importId,
+      itemsJSON: nativeShareItemsJSON([
+        ["type": 2, "value": owned.absoluteString],
+      ]),
+      message: nil,
+      statusJSON: nativeShareStatusJSON(id: importId, isInProgress: false)
+    ))
+    XCTAssertTrue(try store.acknowledge(id: importId))
+
+    XCTAssertFalse(try store.clearStatus(id: nil))
+    XCTAssertNotNil(try store.currentStatusJSON())
+    XCTAssertTrue(try store.clearStatus(id: importId))
+    XCTAssertNil(try store.currentStatusJSON())
+    XCTAssertTrue(FileManager.default.fileExists(atPath: owned.path))
+    XCTAssertFalse(try store.acknowledge(id: importId))
+  }
+
+  func testShareEnvelopeClearReclaimsOnlyUnacknowledgedNativeFiles() throws {
+    let container = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "native-share-clear-\(UUID().uuidString)",
+      isDirectory: true
+    )
+    defer { try? FileManager.default.removeItem(at: container) }
+    let staging = container.appendingPathComponent(
+      nativeShareStagingDirectoryName,
+      isDirectory: true
+    )
+    try FileManager.default.createDirectory(
+      at: staging,
+      withIntermediateDirectories: true
+    )
+    let importId = UUID().uuidString.lowercased()
+    let otherId = UUID().uuidString.lowercased()
+    let owned = staging.appendingPathComponent(
+      "\(importId)-\(UUID().uuidString.lowercased())-0-image.png"
+    )
+    try Data([1]).write(to: owned)
+    let store = NativeShareEnvelopeStore(containerURL: container)
+    try store.beginImport(
+      id: importId,
+      statusJSON: nativeShareStatusJSON(id: importId, isInProgress: true)
+    )
+    XCTAssertTrue(try store.publish(
+      id: importId,
+      itemsJSON: nativeShareItemsJSON([
+        ["type": 2, "value": owned.absoluteString],
+      ]),
+      message: nil,
+      statusJSON: nativeShareStatusJSON(id: importId, isInProgress: false)
+    ))
+
+    XCTAssertFalse(try store.clearStatus(id: otherId))
+    XCTAssertTrue(FileManager.default.fileExists(atPath: owned.path))
+    XCTAssertTrue(try store.clearStatus(id: importId))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: owned.path))
+    XCTAssertNil(try store.currentStatusJSON())
+    XCTAssertFalse(try store.acknowledge(id: importId))
+  }
+
+  func testCorruptLegacyShareRecordIsDiscardedWithoutDeletingUntrustedPaths() throws {
+    let container = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "native-share-corrupt-legacy-\(UUID().uuidString)",
+      isDirectory: true
+    )
+    let staging = container.appendingPathComponent(
+      nativeShareStagingDirectoryName,
+      isDirectory: true
+    )
+    let suiteName = "RunnerTests.NativeShare.\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+    defaults.removePersistentDomain(forName: suiteName)
+    defer {
+      defaults.removePersistentDomain(forName: suiteName)
+      try? FileManager.default.removeItem(at: container)
+    }
+    try FileManager.default.createDirectory(
+      at: staging,
+      withIntermediateDirectories: true
+    )
+    let importId = UUID().uuidString.lowercased()
+    let owned = staging.appendingPathComponent(
+      "\(importId)-\(UUID().uuidString.lowercased())-0-image.png"
+    )
+    let outside = container.appendingPathComponent("outside.png")
+    try Data([1]).write(to: owned)
+    try Data([2]).write(to: outside)
+    defaults.set(
+      try nativeShareItemsJSON([
+        ["type": 2, "value": owned.absoluteString],
+        ["type": 2, "value": outside.absoluteString],
+        ["value": "corrupt-entry-without-type"],
+      ]),
+      forKey: nativeShareLegacyPayloadDefaultsKey
+    )
+    defaults.set(
+      try nativeShareStatusJSON(id: importId, isInProgress: false),
+      forKey: nativeShareLegacyStatusDefaultsKey
+    )
+    defaults.set("legacy", forKey: nativeShareLegacyMessageDefaultsKey)
+    defaults.synchronize()
+
+    let store = NativeShareEnvelopeStore(
+      containerURL: container,
+      legacyDefaults: defaults
+    )
+
+    XCTAssertNil(try store.currentStatusJSON())
+    XCTAssertFalse(FileManager.default.fileExists(atPath: owned.path))
+    XCTAssertTrue(FileManager.default.fileExists(atPath: outside.path))
+    XCTAssertNil(defaults.object(forKey: nativeShareLegacyPayloadDefaultsKey))
+    XCTAssertNil(defaults.object(forKey: nativeShareLegacyStatusDefaultsKey))
+    XCTAssertNil(defaults.object(forKey: nativeShareLegacyMessageDefaultsKey))
+  }
+
+  func testSharePayloadValidationRequiresDurableIdAndOwnedRegularFile() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "native-share-validation-\(UUID().uuidString)",
+      isDirectory: true
+    )
+    let owned = root.appendingPathComponent("shared.png")
+    let outside = FileManager.default.temporaryDirectory.appendingPathComponent(
+      "native-share-outside-\(UUID().uuidString).png"
+    )
+    defer {
+      try? FileManager.default.removeItem(at: root)
+      try? FileManager.default.removeItem(at: outside)
+    }
+    try FileManager.default.createDirectory(
+      at: root,
+      withIntermediateDirectories: true
+    )
+    try Data([1]).write(to: owned)
+    try Data([2]).write(to: outside)
+
+    let valid = nativeValidatedShareImportPayload(
+      rawItems: [
+        ["type": 0, "value": " shared text "],
+        ["type": 2, "value": owned.absoluteString],
+      ],
+      message: nil,
+      status: ["id": " current "],
+      shareStagingDirectoryPath: root.path
+    )
+
+    XCTAssertEqual(valid?["id"] as? String, "current")
+    XCTAssertEqual(valid?["text"] as? String, "shared text")
+    XCTAssertEqual(
+      valid?["filePaths"] as? [String],
+      [owned.resolvingSymlinksInPath().path]
+    )
+    XCTAssertNil(nativeValidatedShareImportPayload(
+      rawItems: [["type": 0, "value": "text"]],
+      message: nil,
+      status: [:],
+      shareStagingDirectoryPath: root.path
+    ))
+    XCTAssertNil(nativeValidatedShareImportPayload(
+      rawItems: [["type": 2]],
+      message: nil,
+      status: ["id": "current"],
+      shareStagingDirectoryPath: root.path
+    ))
+    XCTAssertNil(nativeValidatedShareImportPayload(
+      rawItems: [["type": 2, "value": "file://%"]],
+      message: nil,
+      status: ["id": "current"],
+      shareStagingDirectoryPath: root.path
+    ))
+    XCTAssertNil(nativeValidatedShareImportPayload(
+      rawItems: [["type": 2, "value": "relative.png"]],
+      message: nil,
+      status: ["id": "current"],
+      shareStagingDirectoryPath: root.path
+    ))
+    XCTAssertNil(nativeValidatedShareImportPayload(
+      rawItems: [["type": 2, "value": outside.absoluteString]],
+      message: nil,
+      status: ["id": "current"],
+      shareStagingDirectoryPath: root.path
+    ))
+    XCTAssertNil(nativeValidatedShareImportPayload(
+      rawItems: [],
+      message: "  ",
+      status: ["id": "current"],
+      shareStagingDirectoryPath: root.path
+    ))
+
+    let symlink = root.appendingPathComponent("linked.png")
+    try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: outside)
+    XCTAssertNil(nativeValidatedShareImportPayload(
+      rawItems: [["type": 2, "value": symlink.absoluteString]],
+      message: nil,
+      status: ["id": "current"],
+      shareStagingDirectoryPath: root.path
+    ))
+  }
+
+  func testSharedPayloadBooleanTypesAreNotNumericTextCodes() {
+    XCTAssertFalse(nativeSharedPayloadTypeIsText(false))
+    XCTAssertFalse(nativeSharedPayloadTypeIsText(true))
+    XCTAssertTrue(nativeSharedPayloadTypeIsText(NSNumber(value: 0)))
+    XCTAssertTrue(nativeSharedPayloadTypeIsText(NSNumber(value: 1)))
+  }
+
+  func testConcurrentSttShutdownWaitersShareCompletion() async {
+    let completion = NativeSttShutdownCompletion()
+    let state = AsyncTestFlag()
+    let waiter = Task {
+      await completion.wait()
+      await state.set()
+    }
+
+    try? await Task.sleep(nanoseconds: 10_000_000)
+    let completedBeforeSignal = await state.current()
+    XCTAssertFalse(completedBeforeSignal)
+
+    completion.complete()
+    await waiter.value
+    let completedAfterSignal = await state.current()
+    XCTAssertTrue(completedAfterSignal)
+
+    let startedAt = ProcessInfo.processInfo.systemUptime
+    await completion.wait()
+    XCTAssertLessThan(
+      ProcessInfo.processInfo.systemUptime - startedAt,
+      0.1
+    )
+  }
+
+  func testNativeSttLifecycleSerializesReplacementAfterFullShutdown() async {
+    let lifecycle = NativeSttLifecycleState()
+    let firstTransition = lifecycle.beginStart()
+    await firstTransition.shutdownTask.value
+    let first = TestNativeSttSession()
+    XCTAssertTrue(
+      lifecycle.install(first, generation: firstTransition.generation)
+    )
+
+    let replacementTransition = lifecycle.beginStart()
+    let firstStopStarted = await first.stopStarted.wait(
+      timeoutNanoseconds: 500_000_000
+    )
+    XCTAssertTrue(firstStopStarted)
+    let stale = TestNativeSttSession()
+    XCTAssertFalse(
+      lifecycle.install(stale, generation: firstTransition.generation)
+    )
+    let joinedRetirement = lifecycle.retireIfCurrent(
+      first,
+      generation: firstTransition.generation
+    )
+
+    first.allowStop.complete()
+    await joinedRetirement.value
+    await replacementTransition.shutdownTask.value
+    let replacement = TestNativeSttSession()
+    XCTAssertTrue(
+      lifecycle.install(
+        replacement,
+        generation: replacementTransition.generation
+      )
+    )
+
+    let stopTransition = lifecycle.beginStop()
+    let replacementStopStarted = await replacement.stopStarted.wait(
+      timeoutNanoseconds: 500_000_000
+    )
+    XCTAssertTrue(replacementStopStarted)
+    replacement.allowStop.complete()
+    await stopTransition.shutdownTask.value
+    XCTAssertEqual(first.stopCount, 1)
+    XCTAssertEqual(replacement.stopCount, 1)
+  }
+
+  func testResponseWaitCaptureStartsOnlyAfterFullSttShutdown() async {
+    let lifecycle = NativeSttLifecycleState()
+    let sttTransition = lifecycle.beginStart()
+    await sttTransition.shutdownTask.value
+    let stt = TestNativeSttSession()
+    XCTAssertTrue(lifecycle.install(stt, generation: sttTransition.generation))
+
+    let capture = TestNativeResponseWaitCaptureSession(blocksStop: false)
+    let owner = NativeResponseWaitCaptureOwner(
+      lifecycle: lifecycle,
+      makeSession: { capture }
+    )
+    let responseTransition = owner.prepareBegin(callKitCallId: nil)
+    let finish = Task {
+      await owner.finishBegin(
+        responseTransition,
+        timeoutNanoseconds: 500_000_000
+      )
+    }
+
+    let sttStopStarted = await stt.stopStarted.wait(
+      timeoutNanoseconds: 500_000_000
+    )
+    XCTAssertTrue(sttStopStarted)
+    XCTAssertEqual(capture.startCount, 0)
+
+    stt.allowStop.complete()
+    let didStartCapture = await finish.value
+    XCTAssertTrue(didStartCapture)
+    XCTAssertEqual(capture.startCount, 1)
+
+    await owner.prepareEnd().value
+    XCTAssertEqual(capture.stopCount, 1)
+  }
+
+  func testResponseWaitCaptureSerializesReplacementSttStart() async {
+    let lifecycle = NativeSttLifecycleState()
+    let capture = TestNativeResponseWaitCaptureSession(blocksStop: true)
+    let owner = NativeResponseWaitCaptureOwner(
+      lifecycle: lifecycle,
+      makeSession: { capture }
+    )
+    let responseTransition = owner.prepareBegin(callKitCallId: nil)
+    let didStartCapture = await owner.finishBegin(
+      responseTransition,
+      timeoutNanoseconds: 500_000_000
+    )
+    XCTAssertTrue(didStartCapture)
+
+    owner.relinquishForSttStart()
+    let replacementTransition = lifecycle.beginStart()
+    let replacementInstalled = AsyncTestFlag()
+    let replacement = TestNativeSttSession()
+    let installReplacement = Task {
+      await replacementTransition.shutdownTask.value
+      let installed = lifecycle.install(
+        replacement,
+        generation: replacementTransition.generation
+      )
+      if installed {
+        await replacementInstalled.set()
+      }
+      return installed
+    }
+
+    let captureStopStarted = await capture.stopStarted.wait(
+      timeoutNanoseconds: 500_000_000
+    )
+    XCTAssertTrue(captureStopStarted)
+    let installedBeforeShutdown = await replacementInstalled.current()
+    XCTAssertFalse(installedBeforeShutdown)
+
+    capture.allowStop.complete()
+    let didInstallReplacement = await installReplacement.value
+    XCTAssertTrue(didInstallReplacement)
+    let installedAfterShutdown = await replacementInstalled.current()
+    XCTAssertTrue(installedAfterShutdown)
+
+    // A late response-wait end has no reference to the replacement and cannot
+    // retire it.
+    await owner.prepareEnd().value
+    XCTAssertEqual(replacement.stopCount, 0)
+
+    let cleanup = lifecycle.beginStop()
+    replacement.allowStop.complete()
+    await cleanup.shutdownTask.value
+  }
+
+  func testCallKitActivationSuspendsAndResumesLiveResponseWaitCapture() async {
+    let lifecycle = NativeSttLifecycleState()
+    let capture = TestNativeResponseWaitCaptureSession(blocksStop: false)
+    let owner = NativeResponseWaitCaptureOwner(
+      lifecycle: lifecycle,
+      makeSession: { capture }
+    )
+    let transition = owner.prepareBegin(
+      callKitCallId: "00000000-0000-0000-0000-000000000001"
+    )
+
+    // The request is accepted while CallKit activation is pending, but no mic
+    // engine starts before the system delegates didActivate.
+    let finish = Task {
+      await owner.finishBegin(
+        transition,
+        timeoutNanoseconds: 500_000_000
+      )
+    }
+    await Task.yield()
+    XCTAssertEqual(capture.startCount, 0)
+
+    owner.callKitDidActivate()
+    let didAcceptCapture = await finish.value
+    XCTAssertTrue(didAcceptCapture)
+    XCTAssertEqual(capture.startCount, 1)
+
+    owner.callKitDidDeactivate()
+    XCTAssertEqual(capture.suspendCount, 1)
+
+    owner.callKitDidActivate()
+    XCTAssertEqual(capture.startCount, 2)
+
+    await owner.prepareEnd().value
+    XCTAssertEqual(capture.stopCount, 1)
+    owner.callKitDidActivate()
+    XCTAssertEqual(capture.startCount, 2)
+  }
+
+  func testResponseWaitCaptureFailsWhenCallKitNeverActivates() async {
+    let lifecycle = NativeSttLifecycleState()
+    let capture = TestNativeResponseWaitCaptureSession(blocksStop: false)
+    let owner = NativeResponseWaitCaptureOwner(
+      lifecycle: lifecycle,
+      makeSession: { capture }
+    )
+    let transition = owner.prepareBegin(
+      callKitCallId: "00000000-0000-0000-0000-000000000001"
+    )
+
+    let didStart = await owner.finishBegin(
+      transition,
+      timeoutNanoseconds: 20_000_000
+    )
+
+    XCTAssertFalse(didStart)
+    XCTAssertEqual(capture.startCount, 0)
+    owner.callKitDidActivate()
+    XCTAssertEqual(capture.startCount, 0)
+  }
+
+  func testResponseWaitCaptureUsesSeparateCallKitActivationDeadline() async {
+    let lifecycle = NativeSttLifecycleState()
+    let capture = TestNativeResponseWaitCaptureSession(blocksStop: false)
+    let owner = NativeResponseWaitCaptureOwner(
+      lifecycle: lifecycle,
+      makeSession: { capture }
+    )
+    let transition = owner.prepareBegin(
+      callKitCallId: "00000000-0000-0000-0000-000000000001"
+    )
+    await transition.shutdownTask.value
+    let finished = AsyncTestFlag()
+    let finish = Task {
+      let didStart = await owner.finishBegin(
+        transition,
+        timeoutNanoseconds: 50_000_000,
+        activationTimeoutNanoseconds: 1_000_000_000
+      )
+      await finished.set()
+      return didStart
+    }
+
+    try? await Task.sleep(nanoseconds: 200_000_000)
+    let finishedBeforeActivation = await finished.current()
+    XCTAssertFalse(finishedBeforeActivation)
+    owner.callKitDidActivate()
+
+    let didStart = await finish.value
+    XCTAssertTrue(didStart)
+    XCTAssertEqual(capture.startCount, 1)
+    await owner.prepareEnd().value
+  }
+
+  func testLateCallKitEndCannotRetireReplacementOwnership() {
+    let ownership = NativeCallKitCallOwnership()
+    let first = "00000000-0000-0000-0000-000000000001"
+    let replacement = "00000000-0000-0000-0000-000000000002"
+
+    XCTAssertEqual(ownership.activate(first), .first)
+    XCTAssertEqual(ownership.activate(first), .unchanged)
+    XCTAssertEqual(ownership.activate(replacement), .replacement)
+    XCTAssertFalse(ownership.retireIfActive(first))
+    XCTAssertTrue(ownership.isActive(replacement))
+    XCTAssertTrue(ownership.retireIfActive(replacement))
+  }
+
+  func testReplacementCallKitOwnershipRetiresStaleResponseWaitCapture() async {
+    let lifecycle = NativeSttLifecycleState()
+    let capture = TestNativeResponseWaitCaptureSession(blocksStop: false)
+    let owner = NativeResponseWaitCaptureOwner(
+      lifecycle: lifecycle,
+      makeSession: { capture }
+    )
+    let ownership = NativeCallKitCallOwnership()
+    let first = "00000000-0000-0000-0000-000000000001"
+    let replacement = "00000000-0000-0000-0000-000000000002"
+
+    owner.callKitDidActivate()
+    XCTAssertEqual(ownership.activate(first), .first)
+    let transition = owner.prepareBegin(callKitCallId: first)
+    let didStart = await owner.finishBegin(
+      transition,
+      timeoutNanoseconds: 500_000_000
+    )
+    XCTAssertTrue(didStart)
+    XCTAssertEqual(capture.startCount, 1)
+
+    XCTAssertEqual(ownership.activate(replacement), .replacement)
+    await owner.callKitCallDidChange().value
+    XCTAssertEqual(capture.suspendCount, 1)
+    XCTAssertEqual(capture.stopCount, 1)
+
+    owner.callKitDidActivate()
+    XCTAssertEqual(capture.startCount, 1)
+  }
+
+  func testResponseWaitConfigurationChangeFailureRetiresAndReportsOnce() async {
+    let lifecycle = NativeSttLifecycleState()
+    let failedCapture = TestNativeResponseWaitCaptureSession(blocksStop: false)
+    let replacementCapture = TestNativeResponseWaitCaptureSession(
+      blocksStop: false
+    )
+    var sessions = [failedCapture, replacementCapture]
+    let reportedFailures = TestLockedCounter()
+    let owner = NativeResponseWaitCaptureOwner(
+      lifecycle: lifecycle,
+      makeSession: { sessions.removeFirst() },
+      onTerminalFailure: { _ in reportedFailures.increment() }
+    )
+
+    let firstTransition = owner.prepareBegin(callKitCallId: nil)
+    let firstStarted = await owner.finishBegin(
+      firstTransition,
+      timeoutNanoseconds: 500_000_000
+    )
+    XCTAssertTrue(firstStarted)
+
+    failedCapture.simulateConfigurationChangeFailure()
+    failedCapture.simulateConfigurationChangeFailure()
+    let failedCaptureStopped = await failedCapture.stopStarted.wait(
+      timeoutNanoseconds: 500_000_000
+    )
+    XCTAssertTrue(failedCaptureStopped)
+    XCTAssertEqual(reportedFailures.value, 1)
+    XCTAssertEqual(failedCapture.stopCount, 1)
+
+    let replacementTransition = owner.prepareBegin(callKitCallId: nil)
+    let replacementStarted = await owner.finishBegin(
+      replacementTransition,
+      timeoutNanoseconds: 500_000_000
+    )
+    XCTAssertTrue(replacementStarted)
+    XCTAssertEqual(replacementCapture.startCount, 1)
+    await owner.prepareEnd().value
+  }
+
+  func testResponseWaitPostAcknowledgementResumeFailureIsTerminal() async {
+    let lifecycle = NativeSttLifecycleState()
+    let capture = TestNativeResponseWaitCaptureSession(blocksStop: false)
+    let reportedFailures = TestLockedCounter()
+    let owner = NativeResponseWaitCaptureOwner(
+      lifecycle: lifecycle,
+      makeSession: { capture },
+      activateAudioSession: {},
+      onTerminalFailure: { _ in reportedFailures.increment() }
+    )
+    let transition = owner.prepareBegin(callKitCallId: nil)
+    let started = await owner.finishBegin(
+      transition,
+      timeoutNanoseconds: 500_000_000
+    )
+    XCTAssertTrue(started)
+
+    owner.interruptionBegan()
+    capture.failNextStart()
+    owner.interruptionEnded(shouldResume: true)
+
+    let stopped = await capture.stopStarted.wait(
+      timeoutNanoseconds: 500_000_000
+    )
+    XCTAssertTrue(stopped)
+    XCTAssertEqual(reportedFailures.value, 1)
+    XCTAssertEqual(capture.startCount, 2)
+    XCTAssertEqual(capture.stopCount, 1)
+  }
+
+  func testNativeIosTtsStartAcknowledgementTimesOutExactlyOnce() {
+    let resolved = expectation(description: "TTS start resolved")
+    var results: [Bool] = []
+    let acknowledgement = NativeIosTtsStartAcknowledgement { value in
+      results.append(value as? Bool ?? true)
+      resolved.fulfill()
+    }
+    acknowledgement.armTimeout(after: 0.01) {
+      acknowledgement.resolve(started: false)
+    }
+
+    wait(for: [resolved], timeout: 0.5)
+
+    XCTAssertEqual(results, [false])
+    XCTAssertFalse(acknowledgement.resolve(started: true))
+    XCTAssertEqual(results, [false])
+  }
+
+  func testNativeIosTtsPendingStartsResolveExactlyOnceAcrossQueues() {
+    let pendingStarts = NativeIosTtsPendingStarts()
+    let utterances = (0..<64).map { _ in NSObject() }
+    let resolved = TestLockedCounter()
+
+    for utterance in utterances {
+      pendingStarts.register(
+        NativeIosTtsStartAcknowledgement { _ in resolved.increment() },
+        for: ObjectIdentifier(utterance)
+      )
+    }
+
+    DispatchQueue.concurrentPerform(iterations: utterances.count) { index in
+      _ = pendingStarts.resolve(
+        ObjectIdentifier(utterances[index]),
+        started: true
+      )
+      pendingStarts.resolveAll(started: false)
+    }
+
+    XCTAssertEqual(resolved.value, utterances.count)
+  }
+
+  func testNonCallKitInterruptionReactivatesOnlyWhenSystemAllowsResume() async {
+    let lifecycle = NativeSttLifecycleState()
+    let capture = TestNativeResponseWaitCaptureSession(blocksStop: false)
+    let activationLock = NSLock()
+    var activationCount = 0
+    let owner = NativeResponseWaitCaptureOwner(
+      lifecycle: lifecycle,
+      makeSession: { capture },
+      activateAudioSession: {
+        activationLock.lock()
+        activationCount += 1
+        activationLock.unlock()
+      }
+    )
+    let transition = owner.prepareBegin(callKitCallId: nil)
+    let didStartCapture = await owner.finishBegin(
+      transition,
+      timeoutNanoseconds: 500_000_000
+    )
+    XCTAssertTrue(didStartCapture)
+
+    owner.interruptionBegan()
+    XCTAssertEqual(capture.suspendCount, 1)
+    owner.interruptionEnded(shouldResume: false)
+    XCTAssertEqual(capture.startCount, 1)
+
+    owner.interruptionEnded(shouldResume: true)
+    XCTAssertEqual(capture.startCount, 2)
+    activationLock.lock()
+    let activations = activationCount
+    activationLock.unlock()
+    XCTAssertEqual(activations, 1)
+
+    await owner.prepareEnd().value
+  }
+
+  func testNativeSttCommandTransitionsHonorReceiptOrderBeforeAwaiting() async {
+    let lifecycle = NativeSttLifecycleState()
+    let start = lifecycle.beginStart()
+    let stop = lifecycle.beginStop()
+    let restart = lifecycle.beginStart()
+
+    XCTAssertFalse(lifecycle.isCurrent(start.generation))
+    XCTAssertFalse(lifecycle.isCurrent(stop.generation))
+    XCTAssertTrue(lifecycle.isCurrent(restart.generation))
+
+    await restart.shutdownTask.value
+  }
+
+  func testStaleSttFinishCannotRetireReplacementSession() async {
+    let lifecycle = NativeSttLifecycleState()
+    let firstTransition = lifecycle.beginStart()
+    await firstTransition.shutdownTask.value
+    let first = TestNativeSttSession()
+    XCTAssertTrue(lifecycle.install(first, generation: firstTransition.generation))
+
+    let replacementTransition = lifecycle.beginStart()
+    first.allowStop.complete()
+    await replacementTransition.shutdownTask.value
+    let replacement = TestNativeSttSession()
+    XCTAssertTrue(lifecycle.install(
+      replacement,
+      generation: replacementTransition.generation
+    ))
+
+    await lifecycle.finishIfCurrent(
+      first,
+      generation: firstTransition.generation
+    ).value
+    XCTAssertEqual(replacement.stopCount, 0)
+    XCTAssertTrue(lifecycle.isInstalled(
+      replacement,
+      generation: replacementTransition.generation
+    ))
+
+    let stop = lifecycle.beginStop()
+    replacement.allowStop.complete()
+    await stop.shutdownTask.value
+  }
+
+  func testCurrentSttFinishInvalidatesGenerationBeforeShutdown() async {
+    let lifecycle = NativeSttLifecycleState()
+    let transition = lifecycle.beginStart()
+    await transition.shutdownTask.value
+    let session = TestNativeSttSession()
+    XCTAssertTrue(lifecycle.install(
+      session,
+      generation: transition.generation
+    ))
+
+    let shutdown = lifecycle.finishIfCurrent(
+      session,
+      generation: transition.generation
+    )
+
+    XCTAssertFalse(lifecycle.isCurrent(transition.generation))
+    XCTAssertFalse(lifecycle.isInstalled(
+      session,
+      generation: transition.generation
+    ))
+    session.allowStop.complete()
+    await shutdown.value
+  }
+
+  func testSttEventGateRejectsStaleStartAndSubscriptionEvents() {
+    let gate = NativeSttEventDeliveryGate()
+    var firstSubscriptionEvents: [String] = []
+    gate.listen { value in
+      if let payload = value as? [String: Any],
+         let value = payload["value"] as? String {
+        firstSubscriptionEvents.append(value)
+      }
+    }
+
+    let first = gate.activate(lifecycleGeneration: 1)
+    let replacement = gate.activate(lifecycleGeneration: 2)
+    XCTAssertFalse(gate.deliver(["value": "stale"], token: first))
+    XCTAssertTrue(gate.deliver(["value": "replacement"], token: replacement))
+    XCTAssertEqual(firstSubscriptionEvents, ["replacement"])
+
+    var secondSubscriptionEvents: [String] = []
+    gate.listen { value in
+      if let payload = value as? [String: Any],
+         let value = payload["value"] as? String {
+        secondSubscriptionEvents.append(value)
+      }
+    }
+    XCTAssertFalse(gate.deliver(["value": "old-subscription"], token: replacement))
+    let current = gate.activate(lifecycleGeneration: 2)
+    XCTAssertTrue(gate.deliver(["value": "current"], token: current))
+    gate.cancelSubscription()
+    XCTAssertFalse(gate.deliver(["value": "cancelled"], token: current))
+    XCTAssertEqual(secondSubscriptionEvents, ["current"])
+  }
+
+  func testSttEventGateOnlyOwnerCanDeactivateReplacement() {
+    let gate = NativeSttEventDeliveryGate()
+    var values: [String] = []
+    gate.listen { value in
+      if let payload = value as? [String: Any],
+         let value = payload["value"] as? String {
+        values.append(value)
+      }
+    }
+
+    let retiring = gate.activate(lifecycleGeneration: 1)
+    let replacement = gate.activate(lifecycleGeneration: 2)
+
+    XCTAssertFalse(gate.deactivate(retiring))
+    XCTAssertTrue(gate.deliver(["value": "replacement"], token: replacement))
+    XCTAssertTrue(gate.deactivate(replacement))
+    XCTAssertFalse(gate.deliver(["value": "late"], token: replacement))
+    XCTAssertEqual(values, ["replacement"])
+  }
+
+  func testSttTerminalReservationOrdersDoneAndRejectsLaterResults() {
+    let gate = NativeSttEventDeliveryGate()
+    var eventTypes: [String] = []
+    let doneDelivered = expectation(description: "done delivered")
+    gate.listen { value in
+      guard let payload = value as? [String: Any],
+            let type = payload["type"] as? String else { return }
+      eventTypes.append(type)
+      if type == "done" { doneDelivered.fulfill() }
+    }
+    let token = gate.activate(lifecycleGeneration: 1)
+
+    XCTAssertTrue(gate.enqueue(
+      ["type": "result", "text": "before"],
+      token: token,
+      isTerminal: false
+    ))
+    XCTAssertTrue(gate.enqueue(
+      ["type": "done"],
+      token: token,
+      isTerminal: true
+    ))
+    XCTAssertFalse(gate.enqueue(
+      ["type": "result", "text": "after"],
+      token: token,
+      isTerminal: false
+    ))
+
+    wait(for: [doneDelivered], timeout: 1)
+    XCTAssertEqual(eventTypes, ["result", "done"])
+    XCTAssertFalse(gate.deliver(["type": "result"], token: token))
+  }
+
+  func testDictationAudioOverflowReportsOneFailureAndStopsContinuousOutput() throws {
+    let input = try XCTUnwrap(AVAudioFormat(
+      commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 1, interleaved: false
+    ))
+    let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: input, frameCapacity: 480))
+    buffer.frameLength = 480
+    buffer.floatChannelData?[0].initialize(repeating: 0, count: 480)
+    let entered = DispatchSemaphore(value: 0)
+    let resume = DispatchSemaphore(value: 0)
+    let overflow = expectation(description: "overflow reported")
+    var events: [[String: Any]] = []
+    let emitter = try NativeDictationAudioEmitter(format: input) { event in
+      if events.isEmpty {
+        entered.signal()
+        _ = resume.wait(timeout: .now() + 5)
+      }
+      events.append(event)
+      if event["type"] as? String == "error" { overflow.fulfill() }
+    }
+    emitter.append(buffer)
+    XCTAssertEqual(entered.wait(timeout: .now() + 2), .success)
+    // The worker holds one lease; three more fill the pool. Later appends
+    // cannot wait for it and must report a single truncated-recording error.
+    for _ in 0..<5 { emitter.append(buffer) }
+    resume.signal()
+    wait(for: [overflow], timeout: 2)
+    // The worker has released its leases. An admitted buffer must still be suppressed.
+    emitter.append(buffer)
+    emitter.close()
+    let errors = events.filter { $0["type"] as? String == "error" }
+    XCTAssertEqual(errors.count, 1)
+    XCTAssertEqual(errors.first?["code"] as? String, "AUDIO_PRESERVATION_FAILED")
+    XCTAssertEqual(events.last?["type"] as? String, "error")
+  }
+
+  func testNativeSttStopAcknowledgementTimeoutDoesNotCancelDeferredCleanup() async {
+    let cleanupCanFinish = NativeSttShutdownCompletion()
+    let cleanup = Task {
+      await cleanupCanFinish.wait()
+    }
+    let startedAt = ProcessInfo.processInfo.systemUptime
+
+    let completed = await waitForNativeSttTask(
+      cleanup,
+      timeoutNanoseconds: 10_000_000
+    )
+
+    XCTAssertFalse(completed)
+    XCTAssertLessThan(
+      ProcessInfo.processInfo.systemUptime - startedAt,
+      0.5
+    )
+    cleanupCanFinish.complete()
+    await cleanup.value
+  }
+
+  func testNativeSttResourceMutationGateClosesAndDrainsWithoutBlockingMutation() async {
+    let gate = NativeSttResourceMutationGate()
+    XCTAssertTrue(gate.begin())
+    gate.close()
+    XCTAssertFalse(gate.begin())
+    let drained = NativeSttShutdownCompletion()
+    let waiter = Task {
+      await gate.waitUntilDrained()
+      drained.complete()
+    }
+
+    let drainedEarly = await drained.wait(timeoutNanoseconds: 10_000_000)
+    XCTAssertFalse(drainedEarly)
+    gate.end()
+    let drainedAfterEnd = await drained.wait(
+      timeoutNanoseconds: 500_000_000
+    )
+    XCTAssertTrue(drainedAfterEnd)
+    await waiter.value
+  }
+
+  func testAppIntentInvocationInterruptionIsExactlyOnceAndMarksDispatchedOwnershipIndeterminate() async {
+    let completion = AppIntentInvocationCompletion()
+    let responseTask = Task { () -> [String: Any] in
+      await withCheckedContinuation { continuation in
+        completion.install(continuation)
+      }
+    }
+
+    XCTAssertTrue(completion.beginDispatch())
+    XCTAssertFalse(completion.beginDispatch())
+    XCTAssertTrue(completion.resolveInterrupted("timed out"))
+    XCTAssertFalse(completion.resolveCompleted(["success": true]))
+
+    let response = await responseTask.value
+    XCTAssertEqual(response["success"] as? Bool, false)
+    XCTAssertEqual(
+      response[appIntentNativeDispatchStateKey] as? String,
+      appIntentNativeDispatchIndeterminate
+    )
+  }
+
+  func testAppIntentInvocationLeaseSeparatesOverlappingDispatches() throws {
+    let suiteName = "RunnerTests.AppIntentInvocation.\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+    defaults.removePersistentDomain(forName: suiteName)
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    var now: Int64 = 1_000
+    let store = AppIntentInvocationStore(
+      defaults: defaults,
+      nowMilliseconds: { now }
+    )
+    let parameters = ["text": "private input"]
+
+    let first = store.lease(
+      identifier: "app.cogwheel.conduit.send_text",
+      canonicalParameters: parameters
+    )
+    let overlap = store.lease(
+      identifier: "app.cogwheel.conduit.send_text",
+      canonicalParameters: parameters
+    )
+    XCTAssertNotEqual(overlap.invocationId, first.invocationId)
+
+    store.resolve(
+      first,
+      dispatchState: appIntentNativeDispatchIndeterminate
+    )
+    let retry = store.lease(
+      identifier: "app.cogwheel.conduit.send_text",
+      canonicalParameters: parameters
+    )
+    XCTAssertEqual(retry.invocationId, first.invocationId)
+    XCTAssertFalse(
+      AppIntentInvocationStore.fingerprint(
+        identifier: "app.cogwheel.conduit.send_text",
+        canonicalParameters: parameters
+      ).contains("private input")
+    )
+
+    store.resolve(overlap, dispatchState: appIntentNativeDispatchCompleted)
+    store.resolve(retry, dispatchState: appIntentNativeDispatchCompleted)
+    let next = store.lease(
+      identifier: "app.cogwheel.conduit.send_text",
+      canonicalParameters: parameters
+    )
+    XCTAssertNotEqual(next.invocationId, first.invocationId)
+
+    now += 6 * 60 * 1_000
+    let expired = store.lease(
+      identifier: "app.cogwheel.conduit.send_text",
+      canonicalParameters: parameters
+    )
+    XCTAssertNotEqual(expired.invocationId, next.invocationId)
+  }
+
+  func testAppIntentInvocationRetryRenewsAndPersistsNearExpiryLease() throws {
+    let suiteName = "RunnerTests.AppIntentInvocationExpiry.\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+    defaults.removePersistentDomain(forName: suiteName)
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    var now: Int64 = 1_000
+    let parameters = ["text": "retry input"]
+    let store = AppIntentInvocationStore(
+      defaults: defaults,
+      nowMilliseconds: { now }
+    )
+    let first = store.lease(
+      identifier: "app.cogwheel.conduit.send_text",
+      canonicalParameters: parameters
+    )
+    store.resolve(
+      first,
+      dispatchState: appIntentNativeDispatchIndeterminate
+    )
+
+    now += 5 * 60 * 1_000 - 1
+    let nearExpiryRetry = store.lease(
+      identifier: "app.cogwheel.conduit.send_text",
+      canonicalParameters: parameters
+    )
+    XCTAssertEqual(nearExpiryRetry.invocationId, first.invocationId)
+    store.resolve(
+      nearExpiryRetry,
+      dispatchState: appIntentNativeDispatchIndeterminate
+    )
+
+    // Advance past the original lease deadline, then recreate the store to
+    // prove that retry renewal was flushed to UserDefaults.
+    now += 2
+    let reloadedStore = AppIntentInvocationStore(
+      defaults: defaults,
+      nowMilliseconds: { now }
+    )
+    let persistedRetry = reloadedStore.lease(
+      identifier: "app.cogwheel.conduit.send_text",
+      canonicalParameters: parameters
+    )
+    XCTAssertEqual(persistedRetry.invocationId, first.invocationId)
+  }
+
+  func testAppIntentInvocationBecomesRetryableAfterStoreRecreation() throws {
+    let suiteName = "RunnerTests.AppIntentInvocationRestart.\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+    defaults.removePersistentDomain(forName: suiteName)
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let parameters = ["text": "interrupted input"]
+    let firstStore = AppIntentInvocationStore(defaults: defaults)
+    let interrupted = firstStore.lease(
+      identifier: "app.cogwheel.conduit.send_text",
+      canonicalParameters: parameters
+    )
+
+    // Store recreation models process termination before resolve() could run.
+    let restartedStore = AppIntentInvocationStore(defaults: defaults)
+    let retry = restartedStore.lease(
+      identifier: "app.cogwheel.conduit.send_text",
+      canonicalParameters: parameters
+    )
+    XCTAssertEqual(retry.invocationId, interrupted.invocationId)
+  }
+
+  func testNativeSttPcmCopyPreservesInterleavedChannelStride() throws {
+    let format = try XCTUnwrap(
+      AVAudioFormat(
+        commonFormat: .pcmFormatInt16,
+        sampleRate: 16_000,
+        channels: 2,
+        interleaved: true
+      )
+    )
+    let source = try XCTUnwrap(
+      AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 3)
+    )
+    source.frameLength = 3
+    let sourceBuffers = UnsafeMutableAudioBufferListPointer(
+      source.mutableAudioBufferList
+    )
+    let sourceSamples = try XCTUnwrap(sourceBuffers[0].mData)
+      .bindMemory(to: Int16.self, capacity: 6)
+    let expected: [Int16] = [1, 11, 2, 22, 3, 33]
+    for (index, value) in expected.enumerated() {
+      sourceSamples[index] = value
+    }
+
+    let copied = try XCTUnwrap(copyNativeSttPCMBuffer(source))
+    let copiedBuffers = UnsafeMutableAudioBufferListPointer(
+      copied.mutableAudioBufferList
+    )
+    let copiedSamples = try XCTUnwrap(copiedBuffers[0].mData)
+      .bindMemory(to: Int16.self, capacity: 6)
+
+    XCTAssertEqual(copied.frameLength, 3)
+    XCTAssertEqual(
+      (0..<expected.count).map { copiedSamples[$0] },
+      expected
+    )
+  }
+
+  func testNativeSttPcmCopyRejectsUninitializedSamples() throws {
+    let format = try XCTUnwrap(
+      AVAudioFormat(
+        commonFormat: .pcmFormatFloat32,
+        sampleRate: 16_000,
+        channels: 1,
+        interleaved: false
+      )
+    )
+    let source = try XCTUnwrap(
+      AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 8)
+    )
+
+    XCTAssertNil(copyNativeSttPCMBuffer(source))
+  }
+
+  func testNativeSttPcmBufferPoolIsFixedCapacityAndReusable() throws {
+    let format = try XCTUnwrap(
+      AVAudioFormat(
+        commonFormat: .pcmFormatInt16,
+        sampleRate: 16_000,
+        channels: 1,
+        interleaved: true
+      )
+    )
+    let source = try XCTUnwrap(
+      AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 4)
+    )
+    source.frameLength = 4
+    let samples = try XCTUnwrap(source.int16ChannelData?[0])
+    for index in 0..<4 { samples[index] = Int16(index + 1) }
+    let pool = try XCTUnwrap(
+      NativeSttPCMBufferPool(format: format, frameCapacity: 4, count: 2)
+    )
+
+    let first = try XCTUnwrap(pool.copyFromTap(source))
+    let second = try XCTUnwrap(pool.copyFromTap(source))
+    XCTAssertNil(pool.copyFromTap(source))
+    XCTAssertEqual(pool.availableCount, 0)
+    XCTAssertEqual(first.buffer.frameLength, 4)
+    XCTAssertEqual(first.buffer.int16ChannelData?[0][3], 4)
+
+    first.release()
+    XCTAssertEqual(pool.availableCount, 1)
+    let reused = try XCTUnwrap(pool.copyFromTap(source))
+    XCTAssertEqual(pool.availableCount, 0)
+    second.release()
+    reused.release()
+    XCTAssertEqual(pool.availableCount, 2)
+  }
+
+  func testNativeSttPcmBufferPoolCopiesOversizedTapBuffersOffPool() throws {
+    let format = try XCTUnwrap(
+      AVAudioFormat(
+        commonFormat: .pcmFormatInt16,
+        sampleRate: 16_000,
+        channels: 1,
+        interleaved: true
+      )
+    )
+    // iOS treats the requested tap bufferSize as a hint; a delivered buffer
+    // larger than a pool slot must still reach the analyzer.
+    let source = try XCTUnwrap(
+      AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 8)
+    )
+    source.frameLength = 8
+    let samples = try XCTUnwrap(source.int16ChannelData?[0])
+    for index in 0..<8 { samples[index] = Int16(index + 1) }
+    let pool = try XCTUnwrap(
+      NativeSttPCMBufferPool(format: format, frameCapacity: 4, count: 2)
+    )
+
+    let oversized = try XCTUnwrap(pool.copyFromTap(source))
+    XCTAssertEqual(pool.availableCount, 2)
+    XCTAssertEqual(oversized.buffer.frameLength, 8)
+    XCTAssertEqual(oversized.buffer.int16ChannelData?[0][7], 8)
+
+    // Releasing a one-off lease must not mint a phantom pool slot.
+    oversized.release()
+    XCTAssertEqual(pool.availableCount, 2)
+
+    source.frameLength = 4
+    let pooledFirst = try XCTUnwrap(pool.copyFromTap(source))
+    let pooledSecond = try XCTUnwrap(pool.copyFromTap(source))
+    XCTAssertNil(pool.copyFromTap(source))
+    pooledFirst.release()
+    pooledSecond.release()
+    XCTAssertEqual(pool.availableCount, 2)
+  }
+
+  func testAvatarSelectionGenerationInvalidatesStaleCompression() {
+    let generation = NativeAvatarSelectionGeneration()
+    let firstPhoto = generation.begin()
+    let secondPhoto = generation.begin()
+
+    XCTAssertFalse(generation.isCurrent(firstPhoto))
+    XCTAssertTrue(generation.isCurrent(secondPhoto))
+
+    generation.invalidate()
+    XCTAssertFalse(generation.isCurrent(secondPhoto))
+  }
+
+  func testAvatarPreviewMutationInvalidatesInitialImageLoad() {
+    let generation = NativeAvatarSelectionGeneration()
+    let initialImageLoad = generation.begin()
+
+    generation.invalidate()
+
+    XCTAssertFalse(generation.isCurrent(initialImageLoad))
+  }
+
+  func testHostOnlyCookieDoesNotMatchSubdomain() throws {
+    let hostOnly = try testCookie(domain: "example.test", path: "/")
+    let domain = try testCookie(domain: ".example.test", path: "/")
+    let subdomainUrl = try XCTUnwrap(URL(string: "https://sub.example.test/"))
+
+    XCTAssertFalse(cookieMatchesUrl(cookie: hostOnly, url: subdomainUrl))
+    XCTAssertTrue(cookieMatchesUrl(cookie: domain, url: subdomainUrl))
+  }
+
+  func testSecureCookieDoesNotMatchHttpUrl() throws {
+    let secureCookie = try testCookie(
+      domain: "example.test",
+      path: "/",
+      secure: true
+    )
+
+    XCTAssertFalse(
+      cookieMatchesUrl(
+        cookie: secureCookie,
+        url: try XCTUnwrap(URL(string: "http://example.test/"))
+      )
+    )
+    XCTAssertTrue(
+      cookieMatchesUrl(
+        cookie: secureCookie,
+        url: try XCTUnwrap(URL(string: "https://example.test/"))
+      )
+    )
+  }
+
+  func testCookiePathRequiresRfcBoundary() throws {
+    let cookie = try testCookie(domain: "example.test", path: "/foo")
+
+    XCTAssertTrue(
+      cookieMatchesUrl(
+        cookie: cookie,
+        url: try XCTUnwrap(URL(string: "https://example.test/foo/bar"))
+      )
+    )
+    XCTAssertFalse(
+      cookieMatchesUrl(
+        cookie: cookie,
+        url: try XCTUnwrap(URL(string: "https://example.test/foobar"))
+      )
+    )
+  }
+
+  func testCookiePathDoesNotTreatEncodedSlashAsBoundary() throws {
+    let cookie = try testCookie(domain: "example.test", path: "/admin")
+
+    XCTAssertFalse(
+      cookieMatchesUrl(
+        cookie: cookie,
+        url: try XCTUnwrap(
+          URL(string: "https://example.test/admin%2Fpublic")
+        )
+      )
+    )
+    XCTAssertTrue(
+      cookieMatchesUrl(
+        cookie: cookie,
+        url: try XCTUnwrap(
+          URL(string: "https://example.test/admin/%2Fpublic")
+        )
+      )
+    )
+  }
+
+  func testDuplicateCookieNamesPreferLongestMatchingPathDeterministically() throws {
+    let root = try testCookie(
+      name: "session",
+      value: "root",
+      domain: "example.test",
+      path: "/"
+    )
+    let scoped = try testCookie(
+      name: "session",
+      value: "scoped",
+      domain: "example.test",
+      path: "/foo"
+    )
+    let url = try XCTUnwrap(URL(string: "https://example.test/foo/bar"))
+
+    XCTAssertEqual(
+      cookieValuesForUrl(cookies: [root, scoped], url: url)["session"],
+      "scoped"
+    )
+    XCTAssertEqual(
+      cookieValuesForUrl(cookies: [scoped, root], url: url)["session"],
+      "scoped"
+    )
+  }
+
+}
+
+private func testCookie(
+  name: String = "session",
+  value: String = "value",
+  domain: String,
+  path: String,
+  secure: Bool = false
+) throws -> HTTPCookie {
+  var properties: [HTTPCookiePropertyKey: Any] = [
+    .name: name,
+    .value: value,
+    .domain: domain,
+    .path: path,
+  ]
+  if secure {
+    properties[.secure] = "TRUE"
+  }
+  return try XCTUnwrap(HTTPCookie(properties: properties))
+}
+
+private actor AsyncTestFlag {
+  private var value = false
+
+  func set() {
+    value = true
+  }
+
+  func current() -> Bool {
+    value
+  }
+}
+
+private final class TestNativeSttSession: NativeSttSession {
+  let stopStarted = NativeSttShutdownCompletion()
+  let allowStop = NativeSttShutdownCompletion()
+  private let lock = NSLock()
+  private var storedStopCount = 0
+
+  var stopCount: Int {
+    lock.lock()
+    let value = storedStopCount
+    lock.unlock()
+    return value
+  }
+
+  func stop() async {
+    recordStop()
+    stopStarted.complete()
+    await allowStop.wait()
+  }
+
+  private func recordStop() {
+    lock.lock()
+    storedStopCount += 1
+    lock.unlock()
+  }
+}
+
+private final class TestNativeResponseWaitCaptureSession:
+  NativeResponseWaitCaptureSession {
+  let stopStarted = NativeSttShutdownCompletion()
+  let allowStop = NativeSttShutdownCompletion()
+  private let lock = NSLock()
+  private var storedStartCount = 0
+  private var storedSuspendCount = 0
+  private var storedStopCount = 0
+  private var terminalFailureHandler: ((Error) -> Void)?
+  private var shouldFailNextStart = false
+  private var stopped = false
+
+  init(blocksStop: Bool) {
+    if !blocksStop {
+      allowStop.complete()
+    }
+  }
+
+  var startCount: Int {
+    lock.lock()
+    let value = storedStartCount
+    lock.unlock()
+    return value
+  }
+
+  var suspendCount: Int {
+    lock.lock()
+    let value = storedSuspendCount
+    lock.unlock()
+    return value
+  }
+
+  var stopCount: Int {
+    lock.lock()
+    let value = storedStopCount
+    lock.unlock()
+    return value
+  }
+
+  func startCapture() throws {
+    lock.lock()
+    if stopped {
+      lock.unlock()
+      throw NSError(
+        domain: "TestNativeResponseWaitCaptureSession",
+        code: 3,
+        userInfo: nil
+      )
+    }
+    storedStartCount += 1
+    let shouldFail = shouldFailNextStart
+    shouldFailNextStart = false
+    lock.unlock()
+    if shouldFail {
+      throw NSError(
+        domain: "TestNativeResponseWaitCaptureSession",
+        code: 2,
+        userInfo: nil
+      )
+    }
+  }
+
+  func failNextStart() {
+    lock.lock()
+    shouldFailNextStart = true
+    lock.unlock()
+  }
+
+  func suspendCapture() {
+    lock.lock()
+    storedSuspendCount += 1
+    lock.unlock()
+  }
+
+  func setTerminalFailureHandler(_ handler: @escaping (Error) -> Void) {
+    lock.lock()
+    if !stopped {
+      terminalFailureHandler = handler
+    }
+    lock.unlock()
+  }
+
+  func simulateConfigurationChangeFailure() {
+    lock.lock()
+    let handler = terminalFailureHandler
+    lock.unlock()
+    handler?(
+      NSError(
+        domain: "TestNativeResponseWaitCaptureSession",
+        code: 1,
+        userInfo: nil
+      )
+    )
+  }
+
+  func stop() async {
+    lock.lock()
+    storedStopCount += 1
+    stopped = true
+    terminalFailureHandler = nil
+    lock.unlock()
+    stopStarted.complete()
+    await allowStop.wait()
+  }
+}
+
+private final class TestLockedCounter {
+  private let lock = NSLock()
+  private var storedValue = 0
+
+  func increment() {
+    lock.lock()
+    storedValue += 1
+    lock.unlock()
+  }
+
+  var value: Int {
+    lock.lock()
+    let result = storedValue
+    lock.unlock()
+    return result
+  }
+}
+
+/// Serves canned replies to the linked image download, keyed by address.
+private final class LinkedImageStubProtocol: URLProtocol {
+  struct Reply {
+    var status = 200
+    var mimeType: String?
+    var body = Data()
+    var length: Int64?
+    var redirect: String?
+  }
+
+  static var replies: [String: Reply] = [:]
+
+  override class func canInit(with request: URLRequest) -> Bool { true }
+
+  override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+    request
+  }
+
+  override func startLoading() {
+    guard let url = request.url,
+          let reply = Self.replies[url.absoluteString]
+    else {
+      client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+      return
+    }
+    if let redirect = reply.redirect, let target = URL(string: redirect) {
+      let response = HTTPURLResponse(
+        url: url,
+        statusCode: 302,
+        httpVersion: "HTTP/1.1",
+        headerFields: ["Location": redirect]
+      )!
+      client?.urlProtocol(
+        self,
+        wasRedirectedTo: URLRequest(url: target),
+        redirectResponse: response
+      )
+      return
+    }
+    var headers: [String: String] = [:]
+    headers["Content-Type"] = reply.mimeType
+    headers["Content-Length"] = reply.length.map { "\($0)" }
+    let response = HTTPURLResponse(
+      url: url,
+      statusCode: reply.status,
+      httpVersion: "HTTP/1.1",
+      headerFields: headers
+    )!
+    client?.urlProtocol(
+      self,
+      didReceive: response,
+      cacheStoragePolicy: .notAllowed
+    )
+    client?.urlProtocol(self, didLoad: reply.body)
+    client?.urlProtocolDidFinishLoading(self)
+  }
+
+  override func stopLoading() {}
+}
+
+private final class SelectionMenuTestMessenger: NSObject, FlutterBinaryMessenger {
+  var handler: FlutterBinaryMessageHandler?
+
+  func send(onChannel channel: String, message: Data?) {}
+  func send(onChannel channel: String, message: Data?, binaryReply callback: FlutterBinaryReply?) {}
+  func setMessageHandlerOnChannel(
+    _ channel: String, binaryMessageHandler handler: FlutterBinaryMessageHandler?
+  ) -> FlutterBinaryMessengerConnection {
+    self.handler = handler
+    return 1
+  }
+  func cleanUpConnection(_ connection: FlutterBinaryMessengerConnection) {}
+}
+
+private final class SelectionMenuTestAnimator: NSObject, UIEditMenuInteractionAnimating {
+  var completion: (() -> Void)?
+  func addAnimations(_ animations: @escaping () -> Void) { animations() }
+  func addCompletion(_ completion: @escaping () -> Void) { self.completion = completion }
+}
+
+private final class SelectionMenuTestHost: ConduitBridgeHost {
+  let messenger: FlutterBinaryMessenger
+  let presentingViewController: UIViewController?
+  let activeWindowScene: UIWindowScene? = nil
+  let appGroupIdentifier: String? = nil
+
+  init(messenger: FlutterBinaryMessenger, controller: UIViewController) {
+    self.messenger = messenger
+    presentingViewController = controller
+  }
+}

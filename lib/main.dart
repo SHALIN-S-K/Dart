@@ -1,0 +1,1768 @@
+import 'dart:async';
+import 'dart:developer' as developer;
+
+import 'package:conduit_core/conduit_core.dart';
+import 'package:conduit/shared/widgets/platform_ui/platform_ui.dart';
+import 'package:drift/drift.dart';
+import 'package:flutter/foundation.dart'
+    show
+        LicenseEntryWithLineBreaks,
+        LicenseRegistry,
+        TargetPlatform,
+        defaultTargetPlatform,
+        kIsWeb;
+import 'package:flutter_driver/driver_extension.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter/rendering.dart';
+import 'package:flutter/services.dart' show rootBundle;
+import 'package:package_info_plus/package_info_plus.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import 'shared/widgets/error_boundary.dart';
+import 'platform/android_ime_inset_resync.dart';
+import 'platform/flutter_app_lifecycle.dart';
+import 'platform/flutter_clipboard_port.dart';
+import 'platform/flutter_connectivity_port.dart';
+import 'platform/realtime_pcm_audio.dart';
+import 'platform/webrtc_realtime_media.dart';
+import 'platform/url_launcher_open_external_url_port.dart';
+import 'platform/flutter_cookie_jar.dart';
+import 'platform/flutter_flush_scheduler.dart';
+import 'platform/flutter_post_frame_scheduler.dart';
+import 'platform/ios_display_boost.dart';
+import 'platform/mobile_background_execution.dart';
+
+import 'package:conduit_core/services/share_staging_cleanup.dart'
+    show shareStagingDirectoryName;
+
+import 'platform/ios_share_staging.dart';
+import 'platform/just_audio_playback.dart';
+import 'platform/record_audio_capture.dart';
+import 'platform/flutter_secure_key_value_store.dart';
+import 'platform/flutter_key_value_store.dart';
+import 'platform/flutter_log_sink.dart';
+import 'platform/flutter_worker_port.dart';
+import 'platform/flutter_database_opener.dart';
+import 'platform/geolocator_location_port.dart';
+import 'platform/go_router_navigator.dart';
+import 'platform/wakelock_plus_port.dart';
+
+import 'package:conduit_core/providers/app_providers.dart';
+
+import 'package:conduit_core/providers/host_ports.dart';
+
+import 'package:conduit_core/network/conduit_user_agent.dart';
+
+import 'core/persistence/hive_bootstrap.dart';
+import 'core/utils/model_logos.dart';
+
+import 'package:conduit_core/persistence/hive_prefs_migrator.dart';
+
+import 'package:conduit_core/persistence/persistence_migrator.dart';
+
+import 'package:conduit_core/persistence/persistence_providers.dart';
+import 'package:conduit_core/persistence/preferences_store.dart';
+
+import 'core/router/app_router.dart';
+import 'core/services/native_sheet_bridge.dart';
+import 'core/services/native_sheet_hydration_service.dart';
+import 'shared/services/flutter_ui_requests.dart';
+import 'shared/services/navigation_service.dart';
+import 'shared/services/raster_media_policy.dart';
+import 'platform/carplay_service.dart';
+import 'core/services/native_symbol_image_service.dart';
+
+import 'package:conduit_core/services/readiness_gated_secure_storage.dart';
+import 'package:conduit_core/features/chat/server_speech/direct_voice_provider_settings.dart';
+import 'package:conduit_core/features/chat/realtime_call/realtime_call_availability.dart';
+import 'package:conduit_core/services/settings_service.dart';
+import 'package:conduit_core/features/automations/providers/automation_providers.dart'
+    show scheduledTasksEntryVisibleProvider;
+import 'package:conduit_core/features/calendar/providers/calendar_providers.dart'
+    show calendarAvailableProvider;
+import 'package:conduit_core/features/chat/providers/chat_providers.dart'
+    show chatDataControlsEntryVisibleProvider;
+import 'package:conduit_core/features/integrations/providers/personal_connections_providers.dart';
+
+import 'package:conduit_core/sync/request_completion_runner_provider.dart';
+
+import 'core/utils/message_action_settings.dart';
+import 'core/utils/native_sheet_utils.dart'
+    show
+        nativeAccountAddActionId,
+        nativeNoVoiceProviderId,
+        nativeVoiceProviderFieldIds,
+        nativeAccountServerActionId,
+        nativeAccountSignOutActionId,
+        nativeAccountSwitchActionId,
+        nativeDirectEditActionId,
+        nativeHermesUseActionId,
+        nativeAdvancedFeaturesId,
+        nativeCitationShowTitlesId,
+        nativeCitationBackgroundId,
+        nativeMemoryEditorActionPrefix,
+        nativeMemoryEditorNewActionId,
+        nativeNotificationTargetsActionId;
+import 'shared/utils/ui_utils.dart';
+import 'core/utils/tts_voice_utils.dart';
+import 'core/utils/current_localizations.dart';
+
+import 'package:conduit_core/features/chat/services/request_completion_runner.dart';
+
+import 'features/chat/providers/text_to_speech_provider.dart';
+import 'core/services/callkit_service.dart';
+import 'features/chat/services/voice_input_service.dart';
+import 'features/chat/voice_mode/chat_voice_audio_session_coordinator.dart';
+import 'features/chat/voice_mode/chat_voice_mode_controller.dart';
+
+import 'package:conduit_core/features/chat/providers/chat_providers.dart'
+    show
+        chatWakelockCoordinatorProvider,
+        isChatStreamingProvider,
+        localChatGenerationActiveProvider,
+        restoreDefaultModel;
+import 'package:conduit_core/features/release_notes/release_notes_bootstrap.dart';
+
+import 'features/release_notes/release_notes_coordinator.dart';
+import 'features/release_notes/data/release_notes_repository.dart';
+import 'features/release_notes/release_notes_presenter.dart';
+import 'l10n/conduit_localizations.dart';
+import 'shared/widgets/legacy_design_compatibility.dart';
+
+import 'package:conduit_core/features/tools/providers/tools_providers.dart';
+
+import 'package:conduit_core/features/notifications/providers/notification_target_providers.dart'
+    show notificationTargetsAvailableProvider;
+
+import 'features/profile/views/personalization_page.dart' show showMemoryEditor;
+import 'features/workspace/providers/workspace_capabilities_provider.dart';
+import 'features/workspace/workspace_navigation.dart';
+
+import 'package:conduit_core/utils/debug_logger.dart';
+
+import 'core/utils/system_ui_style.dart';
+
+import 'package:conduit_core/models/server_memory.dart';
+import 'package:conduit_core/models/tool.dart';
+
+import 'package:conduit/l10n/app_localizations.dart';
+
+import 'platform/quick_actions_service.dart';
+import 'core/providers/app_startup_providers.dart';
+import 'features/notifications/services/local_notification_service.dart';
+import 'shared/widgets/sign_out_options_dialog.dart';
+import 'shared/theme/theme_extensions.dart';
+import 'shared/theme/theme_providers.dart';
+import 'platform/frame_profiler.dart';
+import 'features/direct_connections/providers/apple_pcc_providers.dart';
+import 'features/direct_connections/services/apple_pcc_adapter.dart'
+    show PigeonApplePccHost;
+
+import 'package:conduit_core/features/direct_connections/providers/direct_connection_providers.dart';
+
+import 'shared/services/app_package_info.dart';
+
+import 'package:conduit_core/features/hermes/providers/hermes_providers.dart';
+
+import 'features/hermes/services/hermes_dashboard_rest_bridge.dart';
+import 'features/hermes/widgets/hermes_connection_switcher.dart';
+import 'package:conduit_core/features/chat/providers/chat_handoff_providers.dart';
+import 'features/chat/services/chat_handoff_host.dart';
+import 'package:conduit_core/providers/openwebui_accounts_controller.dart';
+import 'package:conduit_core/providers/openwebui_route_resolver.dart'
+    show openWebUiRouteResolverProvider;
+import 'core/services/background_streaming_handler.dart';
+import 'features/profile/widgets/account_actions.dart';
+import 'features/profile/widgets/account_sheet.dart'
+    show EditDirectConnectionRequest, showAccountSheet;
+
+const bool _enableFlutterDriverExtension = bool.fromEnvironment(
+  'ENABLE_FLUTTER_DRIVER_EXTENSION',
+  defaultValue: false,
+);
+
+Locale? _localeFromNativeTag(String code) {
+  final normalized = code.replaceAll('_', '-');
+  final parts = normalized.split('-');
+  if (parts.isEmpty || parts.first.isEmpty) return null;
+
+  final language = parts.first;
+  String? script;
+  String? country;
+
+  for (var i = 1; i < parts.length; i++) {
+    final part = parts[i];
+    if (part.length == 4) {
+      script = '${part[0].toUpperCase()}${part.substring(1).toLowerCase()}';
+    } else if (part.length == 2 || part.length == 3) {
+      country = part.toUpperCase();
+    }
+  }
+
+  return Locale.fromSubtags(
+    languageCode: language,
+    scriptCode: script,
+    countryCode: country,
+  );
+}
+
+developer.TimelineTask? _startupTimeline;
+
+Future<void> _configureUserAgent() async {
+  try {
+    final packageInfo = await PackageInfo.fromPlatform();
+    ConduitUserAgent.configure(appVersion: packageInfo.version);
+    _startupTimeline?.instant('user_agent_ready');
+  } catch (error, stackTrace) {
+    DebugLogger.error(
+      'user-agent-version-unavailable',
+      scope: 'app/startup',
+      error: error,
+      stackTrace: stackTrace,
+    );
+  }
+}
+
+void _registerBundledLicenses() {
+  LicenseRegistry.addLicense(() async* {
+    final notice = await rootBundle.loadString('THIRD_PARTY_NOTICES.md');
+    yield LicenseEntryWithLineBreaks(const [
+      'Open WebUI icon',
+      'ddgs',
+      'models.dev',
+    ], notice);
+  });
+}
+
+/// Whether this device runs realtime voice calls' audio: the native engine
+/// and WebRTC exist on iOS and Android.
+bool get _hasRealtimeAudio =>
+    !kIsWeb &&
+    (defaultTargetPlatform == TargetPlatform.iOS ||
+        defaultTargetPlatform == TargetPlatform.android);
+
+void main() {
+  // Diagnostics have no destination until a host gives them one.
+  // Installed first, so startup itself is logged.
+  DebugLogger.sink = const FlutterLogSink();
+  AudioPlaybackPort.hostFactory = JustAudioPlayback.new;
+  BackgroundExecutionPort.hostDefault = const MobileBackgroundExecution();
+  DisplayBoostPort.hostDefault = const IosDisplayBoost();
+  if (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS) {
+    NativeSymbolImageService.hostRenderer = renderNativeSymbolThroughChannel;
+  }
+  LocationPort.hostDefault = const GeolocatorLocationPort();
+  WakelockPort.hostDefault = const WakelockPlusPort();
+  ShareStagingPort.hostDefault = IosShareStaging(
+    stagingDirectoryName: shareStagingDirectoryName,
+  );
+  AudioCapturePort.hostFactory = RecordAudioCapture.new;
+  // The preference store is a host capability too; installed
+  // before bootstrap awaits its first synchronous read.
+  PreferencesStore.installLoader(FlutterKeyValueStore.load);
+
+  if (_enableFlutterDriverExtension) {
+    enableFlutterDriverExtension();
+  }
+
+  runZonedGuarded(
+    () async {
+      WidgetsFlutterBinding.ensureInitialized();
+      // Conduit intentionally owns separate direct-local and per-server files.
+      driftRuntimeOptions.dontWarnAboutMultipleDatabases = true;
+      RasterMediaPolicy.configureGlobalImageCache();
+      // Measure the complete Dart-side startup path, including the first plugin
+      // calls. Package metadata is not required to paint the auth/theme shell;
+      // ConduitUserAgent has a safe fallback until this best-effort update lands.
+      _startupTimeline = developer.TimelineTask();
+      _startupTimeline!.start('app_startup');
+      _startupTimeline!.instant('bindings_initialized');
+      unawaited(_configureUserAgent());
+
+      _registerBundledLicenses();
+      // Read by the synchronous avatar resolver; awaited before runApp.
+      final modelLogosLoaded = ModelLogos.load();
+      FrameProfiler.instance.attachFrameTimings();
+      AndroidImeInsetResync.instance.install();
+
+      // Global error handlers
+      FlutterError.onError = (FlutterErrorDetails details) {
+        DebugLogger.error(
+          'flutter-error',
+          scope: 'app/framework',
+          error: details.exception,
+        );
+        final stack = details.stack;
+        if (stack != null) {
+          debugPrintStack(stackTrace: stack);
+        }
+      };
+      WidgetsBinding.instance.platformDispatcher.onError = (error, stack) {
+        DebugLogger.error(
+          'platform-error',
+          scope: 'app/platform',
+          error: error,
+          stackTrace: stack,
+        );
+        debugPrintStack(stackTrace: stack);
+        return true;
+      };
+
+      // Edge-to-edge is now handled natively in MainActivity.kt for Android 15+
+      // No need for SystemUiMode.edgeToEdge which is deprecated
+      _startupTimeline?.instant('edge_to_edge_configured');
+
+      // Platform options now live inside the adapter, so they cannot drift
+      // apart from the ones SecureCredentialStorage used to keep separately.
+      final secureStorage = FlutterSecureKeyValueStore();
+
+      // Start independent platform/file work together. Quick Actions still
+      // completes before runApp so a cold-launch action cannot be lost, while
+      // storage initialization progresses in parallel with that plugin call.
+      // Keep the underlying Keychain operation separate from the bounded
+      // startup wait. `Future.timeout` does not cancel its source; awaiting
+      // only the wrapper would let auth bootstrap start a second Keychain
+      // read while the first one was still executing on iOS.
+      final keychainWarmupRead = secureStorage
+          .read(key: '_warmup')
+          .catchError((Object _) => null);
+      final keychainWarmupBarrier = keychainWarmupRead.then<void>((_) {});
+      final keychainWarmupDeadline = waitForSecureStorageStartupDeadline(
+        keychainWarmupBarrier,
+      );
+      unawaited(
+        keychainWarmupRead.then<void>((_) {
+          _startupTimeline?.instant('secure_storage_ready');
+        }),
+      );
+      final hiveBoxesFuture = HiveBootstrap.instance.ensureInitialized();
+      final preferencesFuture = PreferencesStore.ensureInitialized();
+      final platformUiFuture = PlatformUiCapabilities.initialize();
+
+      try {
+        await QuickActionsBootstrap.initialize();
+      } catch (error, stackTrace) {
+        DebugLogger.error(
+          'quick-actions-bootstrap',
+          scope: 'app/platform',
+          error: error,
+          stackTrace: stackTrace,
+        );
+      }
+
+      // Initialize Hive and preferences concurrently. Preferences must still be
+      // ready before ProviderContainer construction because theme/locale reads
+      // are synchronous.
+      final hiveBoxes = await hiveBoxesFuture;
+      _startupTimeline?.instant('hive_ready');
+      await preferencesFuture;
+      _startupTimeline?.instant('prefs_ready');
+      await platformUiFuture;
+      _startupTimeline?.instant('platform_ui_ready');
+
+      // Run migration checks (fast-pathed after first run).
+      final migrator = PersistenceMigrator(hiveBoxes: hiveBoxes);
+      await migrator.migrateIfNeeded();
+      // Copy Hive-resident preferences into shared_preferences (PR-1 of the
+      // Hive removal). Runs once; gated + crash-safe.
+      await HivePrefsMigrator(hiveBoxes: hiveBoxes).migrateIfNeeded();
+      await captureReleaseNotesInstallProvenance();
+      _startupTimeline?.instant('migration_complete');
+
+      // Bound time-to-first-paint even if the platform call stalls. Provider
+      // reads use the original in-flight operation as their barrier below, so
+      // timing out here never starts a concurrent second Keychain access.
+      await keychainWarmupDeadline;
+
+      // Finish timeline after first frame paints
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _startupTimeline?.instant('first_frame_rendered');
+        _startupTimeline?.finish();
+        _startupTimeline = null;
+      });
+
+      // One WidgetsBindingObserver for the whole app; every engine that
+      // cares about foreground/background now shares it.
+      final appLifecycle = FlutterAppLifecycle();
+
+      final providerContainer = ProviderContainer(
+        overrides: [
+          // Host ports. `lib/core` declares these without a value so it
+          // stays free of Flutter plugins; each host binds its own.
+          databaseOpenerProvider.overrideWithValue(
+            const FlutterDatabaseOpener(),
+          ),
+          appLifecycleProvider.overrideWithValue(appLifecycle),
+          workerPortProvider.overrideWithValue(const FlutterWorkerPort()),
+          connectivityPortProvider.overrideWithValue(FlutterConnectivityPort()),
+          cookieJarProvider.overrideWithValue(const FlutterCookieJar()),
+          flushSchedulerProvider.overrideWithValue(
+            const FlutterFlushScheduler(),
+          ),
+          postFrameSchedulerProvider.overrideWithValue(
+            const FlutterPostFrameScheduler(),
+          ),
+          signOutResetTargetsProvider.overrideWithValue(
+            themePreferenceResetTargets,
+          ),
+          // A reply streaming in the background (screen locked, another chat
+          // open) is cut off by an account switch just like a visible one.
+          accountChangeReplyGuardProvider.overrideWith((ref) {
+            return () {
+              try {
+                return ref.read(isChatStreamingProvider) ||
+                    ref.read(localChatGenerationActiveProvider) ||
+                    BackgroundStreamingHandler.instance.hasActiveReplyStreams;
+              } catch (_) {
+                return false;
+              }
+            };
+          }),
+          // Replies still being written in the background are Open WebUI's,
+          // which arrive through the active account's address.
+          addressChangeReplyGuardProvider.overrideWith((ref) {
+            return () {
+              try {
+                return (ref.read(isChatStreamingProvider) &&
+                        conversationUsesOpenWebUiStorage(
+                          ref.read(activeConversationProvider),
+                        )) ||
+                    BackgroundStreamingHandler.instance.hasActiveReplyStreams;
+              } catch (_) {
+                return false;
+              }
+            };
+          }),
+          // Posted notifications deep-link into the account that posted them.
+          hostActiveAccountChangedProvider.overrideWith((ref) {
+            return (_) {
+              unawaited(
+                ref
+                    .read(localNotificationServiceProvider)
+                    .cancelAll()
+                    .catchError((Object error, StackTrace stackTrace) {
+                      DebugLogger.error(
+                        'account-switch-notification-clear-failed',
+                        scope: 'notifications/system',
+                        error: error,
+                        stackTrace: stackTrace,
+                      );
+                    }),
+              );
+            };
+          }),
+          // The in-memory selection, so a language change applies to the
+          // next request before the preference write lands.
+          appLanguageTagProvider.overrideWith(
+            (ref) => ref.watch(appLocaleProvider)?.toLanguageTag(),
+          ),
+          // Apple Foundation Models through the Pigeon bridge
+          // (ios/Runner/PccBridge.swift); the adapter lives in conduit_core.
+          applePccHostProvider.overrideWith((ref) => PigeonApplePccHost()),
+          hostDirectProviderAdaptersProvider.overrideWith(
+            (ref) => [ref.watch(applePccAdapterProvider)],
+          ),
+          // The CarPlay scene's channel (ConduitCarPlayBridge.swift); the
+          // coordinator in conduit_core stays idle without it.
+          if (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS)
+            carPlayBridgeProvider.overrideWithValue(
+              const MethodChannelCarPlayBridge(),
+            ),
+          hostHermesDashboardBridgeFactoryProvider.overrideWith(
+            (ref) =>
+                ({required root, required accessHeaders}) =>
+                    HermesDashboardRestBridge(
+                      root: root,
+                      accessHeaders: accessHeaders,
+                    ),
+          ),
+          clipboardPortProvider.overrideWithValue(const FlutterClipboardPort()),
+          uiRequestPortProvider.overrideWithValue(const FlutterUiRequests()),
+          hermesConnectionSwitchPromptProvider.overrideWith(
+            (ref) =>
+                (name) => confirmHermesConnectionSwitch(
+                  ref.read(uiRequestPortProvider),
+                  name,
+                ),
+          ),
+          chatHandoffPromptProvider.overrideWith(
+            (ref) =>
+                (modelName) => confirmChatHandoff(
+                  ref.read(uiRequestPortProvider),
+                  modelName,
+                ),
+          ),
+          chatHandoffOpenerProvider.overrideWith(
+            (ref) =>
+                (model, prompt) => openChatHandoffInApp(ref, model, prompt),
+          ),
+          routeNavigatorProvider.overrideWithValue(const GoRouterNavigator()),
+          openExternalUrlProvider.overrideWithValue(
+            const UrlLauncherOpenExternalUrlPort(),
+          ),
+          secureStorageProvider.overrideWithValue(
+            ReadinessGatedSecureStorage(
+              delegate: secureStorage,
+              readiness: keychainWarmupBarrier,
+            ),
+          ),
+          hiveBoxesProvider.overrideWithValue(hiveBoxes),
+          // Inversion seam (E3): the core/sync drainer reads the no-op
+          // RequestCompletionRunner stub; bind it to the chat implementation so
+          // queued completions re-enter the streaming pipeline.
+          requestCompletionRunnerProvider.overrideWith(
+            (ref) => ref.watch(chatRequestCompletionRunnerProvider),
+          ),
+          // The voice-call controller lives in conduit_core; these are the
+          // host capabilities it drives (voice_mode_ports.dart).
+          voiceModeInputProvider.overrideWith(
+            (ref) => ref.watch(voiceInputServiceProvider),
+          ),
+          voiceModeSpeechProvider.overrideWith(
+            (ref) => ref.watch(textToSpeechServiceProvider),
+          ),
+          voiceCallKitProvider.overrideWith(
+            (ref) => ref.watch(callKitServiceProvider),
+          ),
+          voiceAudioSessionProvider.overrideWith(
+            (ref) => ref.watch(chatVoiceAudioSessionCoordinatorProvider),
+          ),
+          chatVoiceModeBackgroundCoordinatorProvider.overrideWithValue(
+            ChatVoiceModeBackgroundCoordinator(),
+          ),
+          voiceModePlatformProvider.overrideWithValue(
+            const FlutterVoiceModePlatform(),
+          ),
+          // A realtime voice needs the native echo-cancelled audio engine.
+          realtimePcmAudioFactoryProvider.overrideWithValue(
+            () => _hasRealtimeAudio ? MethodChannelRealtimePcmAudio() : null,
+          ),
+          // Hermes's GPT-Live calls run over WebRTC.
+          realtimeWebRtcMediaFactoryProvider.overrideWithValue(
+            () => _hasRealtimeAudio ? WebRtcRealtimeMedia() : null,
+          ),
+        ],
+      );
+      // CarPlay can cold-launch Conduit without a visible Flutter scene, so
+      // install its method-channel handler before frame-scheduled startup work.
+      providerContainer.read(carPlayCoordinatorProvider);
+
+      installConduitErrorWidgetBuilder();
+
+      await modelLogosLoaded;
+      runApp(
+        UncontrolledProviderScope(
+          container: providerContainer,
+          child: const ConduitApp(),
+        ),
+      );
+      developer.Timeline.instantSync('runApp_called');
+    },
+    (error, stack) {
+      DebugLogger.error(
+        'zone-error',
+        scope: 'app',
+        error: error,
+        stackTrace: stack,
+      );
+      debugPrintStack(stackTrace: stack);
+    },
+  );
+}
+
+class ConduitApp extends ConsumerStatefulWidget {
+  const ConduitApp({super.key});
+
+  @override
+  ConsumerState<ConduitApp> createState() => _ConduitAppState();
+}
+
+class _ConduitAppState extends ConsumerState<ConduitApp> {
+  Brightness? _lastAppliedOverlayBrightness;
+  StreamSubscription<NativeSheetEvent>? _nativeSheetSubscription;
+  final Map<String, String> _nativeSheetDraftValues = {};
+  Future<void> _nativeSheetControlQueue = Future<void>.value();
+
+  @override
+  void initState() {
+    super.initState();
+    ref.read(userScopedProviderCleanupProvider);
+    ref.read(openWebUiDuplicateAccountReconcilerProvider);
+    ref.read(openWebUiRouteResolverProvider);
+    ref.read(quickActionsCoordinatorProvider);
+    ref.read(chatWakelockCoordinatorProvider);
+    _nativeSheetSubscription = NativeSheetBridge.instance.events.listen(
+      _handleNativeSheetEvent,
+    );
+
+    // Delay heavy provider initialization until after the first frame so the
+    // initial paint stays responsive.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _initializeAppState());
+  }
+
+  void _handleNativeSheetEvent(NativeSheetEvent event) {
+    switch (event) {
+      case NativeSheetLogoutRequested():
+        unawaited(_handleNativeSheetLogoutRequested());
+      case NativeSheetDismissed():
+        _nativeSheetDraftValues.clear();
+        break;
+      case NativeSheetControlChanged(
+        id: 'sign-out',
+        value: final bool keepServerDetails,
+      ):
+        unawaited(
+          _handleNativeSheetLogoutRequested(
+            keepServerDetails: keepServerDetails,
+          ),
+        );
+      case NativeSheetControlChanged():
+        _nativeSheetControlQueue = _nativeSheetControlQueue.then(
+          (_) => _handleNativeSheetControlChanged(event),
+        );
+      case NativeSheetDetailAppeared(:final detailId):
+        unawaited(
+          ref.read(nativeSheetHydrationServiceProvider).hydrateDetail(detailId),
+        );
+      case NativeEditProfileCommitted():
+        unawaited(_handleNativeEditProfileCommitted(event));
+    }
+  }
+
+  /// The native Settings rows for accounts and connections. Returns whether
+  /// [actionId] was one of them.
+  Future<bool> _handleNativeAccountAction(String actionId, Object? value) async {
+    final context = NavigationService.context;
+    switch (actionId) {
+      case nativeAccountSwitchActionId:
+        if (context == null || value is! String) return true;
+        await switchToSavedAccount(context, ref, value);
+        return true;
+      case nativeAccountAddActionId:
+        if (context == null) return true;
+        await showAddAccountSheet(
+          context,
+          ref,
+          kind: value is String
+              ? AccountKind.values.asNameMap()[value] ?? AccountKind.openWebUi
+              : AccountKind.openWebUi,
+        );
+        return true;
+      case nativeAccountServerActionId:
+        if (value is! String) return true;
+        unawaited(
+          NavigationService.router.pushNamed<void>(
+            RouteNames.serverAddresses,
+            extra: value,
+          ),
+        );
+        return true;
+      case nativeHermesUseActionId:
+        if (context == null || value is! String) return true;
+        await useHermesConnection(context, ref, value);
+        return true;
+      case nativeDirectEditActionId:
+        if (context == null || value is! String) return true;
+        await showAccountSheet(context, EditDirectConnectionRequest(value));
+        return true;
+      case nativeAccountSignOutActionId:
+        if (context == null) return true;
+        final accounts = await ref.read(openWebUiAccountsProvider.future);
+        final active = accounts.where((entry) => entry.isActive).firstOrNull;
+        if (active == null || !context.mounted) return true;
+        await signOutOfSavedAccount(context, ref, active);
+        return true;
+    }
+    return false;
+  }
+
+  Future<void> _handleNativeSheetLogoutRequested({
+    bool? keepServerDetails,
+  }) async {
+    try {
+      var resolvedKeepServerDetails = keepServerDetails;
+      if (resolvedKeepServerDetails == null) {
+        final navigatorContext = NavigationService.context;
+        if (navigatorContext == null) {
+          throw StateError('Native sign-out navigator is unavailable.');
+        }
+        resolvedKeepServerDetails = await showSignOutOptionsDialog(
+          navigatorContext,
+        );
+      }
+      if (!mounted || resolvedKeepServerDetails == null) return;
+      await ref
+          .read(signOutCoordinatorProvider)
+          .signOut(keepServerDetails: resolvedKeepServerDetails);
+    } catch (error, stackTrace) {
+      DebugLogger.error(
+        'native-sign-out-failed',
+        scope: 'native/sheet',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    }
+  }
+
+  Future<void> _handleNativeEditProfileCommitted(
+    NativeEditProfileCommitted event,
+  ) async {
+    try {
+      final account =
+          ref.read(accountProfileProvider).asData?.value ??
+          await ref.read(accountProfileProvider.future);
+      if (account == null) return;
+
+      await ref
+          .read(accountProfileProvider.notifier)
+          .save(
+            name: event.name.trim(),
+            profileImageUrl: event.profileImageUrl.trim(),
+            bio: event.bio,
+            gender: _normalizeOptionalNativeText(event.gender),
+            dateOfBirth: _normalizeOptionalNativeText(event.dateOfBirth),
+            timezone: account.timezone,
+          );
+    } catch (error, stackTrace) {
+      DebugLogger.error(
+        'native-edit-profile-commit-failed',
+        scope: 'native/sheet',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    }
+  }
+
+  /// Mirrors the three Open WebUI-aligned notification prefs to the server when
+  /// toggled from the iOS native sheet. Fire-and-forget: local persistence has
+  /// already succeeded, so a failed sync only loses cross-device parity.
+  void _syncNotificationPrefsToServer({
+    bool? enabled,
+    bool? sound,
+    bool? soundAlways,
+  }) {
+    final api = ref.read(apiServiceProvider);
+    if (api == null) return;
+    unawaited(
+      api
+          .updateUserNotificationSettings(
+            notificationEnabled: enabled,
+            notificationSound: sound,
+            notificationSoundAlways: soundAlways,
+          )
+          .then(
+            (_) {},
+            onError: (Object e, StackTrace st) {
+              DebugLogger.error(
+                'failed to sync notification prefs to server',
+                error: e,
+                stackTrace: st,
+                scope: 'notifications/settings',
+              );
+            },
+          ),
+    );
+  }
+
+  Future<void> _handleNativeSheetControlChanged(
+    NativeSheetControlChanged event,
+  ) async {
+    final value = event.value;
+    try {
+      // Accountless (Hermes, Direct, Apple) "Connect to Open WebUI" row.
+      // Dismiss the native sheet and route into the OWUI connect flow (the
+      // router allows the serverConnection route for accountless users).
+      if (event.id == 'add-owui-server') {
+        NavigationService.openOpenWebUIConnectFromNativeSheet();
+        return;
+      }
+
+      if (await _handleNativeAccountAction(event.id, value)) return;
+
+      if (event.id == NativeSheetRoutes.directConnections) {
+        final request = directConnectionsNativeSheetNavigationRequest;
+        unawaited(
+          NavigationService.router.pushNamed<void>(
+            request.routeName,
+            extra: request.extra,
+          ),
+        );
+        return;
+      }
+
+      if (event.id == NativeSheetRoutes.personalConnections) {
+        // The sheet was built before this arrived, and Advanced or the
+        // account's access can change while it is open. The page enforces the
+        // same rule, but a stale row should not even navigate.
+        if (!ref.read(personalConnectionsEntryVisibleProvider)) {
+          _showNativeOptionUnavailable();
+          return;
+        }
+        final request = personalConnectionsNativeSheetNavigationRequest;
+        unawaited(
+          NavigationService.router.pushNamed<void>(
+            request.routeName,
+            extra: request.extra,
+          ),
+        );
+        return;
+      }
+
+      if (event.id == NativeSheetRoutes.scheduledTasks) {
+        // As for Personal connections: the sheet was built before this
+        // arrived, so a row that went stale (Advanced turned off, the account
+        // or its permission changed) must not navigate.
+        if (!ref.read(scheduledTasksEntryVisibleProvider)) {
+          _showNativeOptionUnavailable();
+          return;
+        }
+        final request = scheduledTasksNativeSheetNavigationRequest;
+        unawaited(
+          NavigationService.router.pushNamed<void>(
+            request.routeName,
+            extra: request.extra,
+          ),
+        );
+        return;
+      }
+
+      if (event.id == NativeSheetRoutes.calendar) {
+        // As for Scheduled tasks: the sheet was built before this arrived, so
+        // a row that went stale (the account or its permission changed) must
+        // not navigate.
+        if (!ref.read(calendarAvailableProvider)) {
+          _showNativeOptionUnavailable();
+          return;
+        }
+        final request = calendarNativeSheetNavigationRequest;
+        unawaited(
+          NavigationService.router.pushNamed<void>(
+            request.routeName,
+            extra: request.extra,
+          ),
+        );
+        return;
+      }
+
+      if (event.id == NativeSheetRoutes.chatDataControls) {
+        // As for Scheduled tasks: the sheet was built before this arrived, so
+        // a row that went stale (Advanced turned off, the account signed out)
+        // must not navigate. The page itself opens its file picker only after
+        // the user acts on it, never while this sheet is still up.
+        if (!ref.read(chatDataControlsEntryVisibleProvider)) {
+          _showNativeOptionUnavailable();
+          return;
+        }
+        final request = chatDataControlsNativeSheetNavigationRequest;
+        unawaited(
+          NavigationService.router.pushNamed<void>(
+            request.routeName,
+            extra: request.extra,
+          ),
+        );
+        return;
+      }
+
+      // Both rows close the sheet themselves and arrive as it slides away, so
+      // their Flutter page is already opening underneath it.
+      if (event.id == NativeSheetRoutes.releaseNotesManual) {
+        final context = NavigationService.context;
+        if (context == null || !context.mounted) return;
+        await _showManualReleaseNotes(context);
+        return;
+      }
+
+      if (event.id == NativeSheetRoutes.openSourceLicenses) {
+        final context = NavigationService.context;
+        if (context == null || !context.mounted) return;
+        showLicensePage(context: context, applicationName: 'Conduit');
+        return;
+      }
+
+      if (event.id.startsWith('tts-voice-pick:')) {
+        await _handleNativeTtsVoicePick(event);
+        return;
+      }
+
+      if (event.id == 'tts-voice-picker' && value is String) {
+        await _handleNativeTtsVoiceSelection(
+          value == '__default__' ? ttsSystemDefaultVoiceId : value,
+        );
+        return;
+      }
+
+      if (event.id == nativeNotificationTargetsActionId) {
+        _openNativeNotificationTargets();
+        return;
+      }
+
+      if (event.id == nativeMemoryEditorNewActionId ||
+          event.id.startsWith(nativeMemoryEditorActionPrefix)) {
+        await _openNativeMemoryEditor(event.id);
+        return;
+      }
+
+      if (event.id.startsWith('memory-save:')) {
+        final encoded = event.id.substring('memory-save:'.length);
+        final memoryId = Uri.decodeComponent(encoded);
+        if (value is String) {
+          await _runNativeMemoryAction(
+            (memories, owner) =>
+                memories.updateItem(memoryId, value, owner: owner),
+          );
+        }
+        return;
+      }
+
+      if (event.id.startsWith('memory-delete:')) {
+        final encoded = event.id.substring('memory-delete:'.length);
+        await _runNativeMemoryAction(
+          (memories, owner) =>
+              memories.deleteItem(Uri.decodeComponent(encoded), owner: owner),
+        );
+        return;
+      }
+
+      if (event.id == 'message-actions-reorder' && value is List) {
+        final selected = ref.read(appSettingsProvider).inlineMessageActions;
+        if (selected == null) return;
+        final ordered = value
+            .whereType<String>()
+            .map((id) => id.replaceFirst('message-action:', ''))
+            .toList();
+        if (value.length != selected.length ||
+            ordered.length != selected.length ||
+            ordered.toSet().length != selected.length ||
+            !ordered.every(selected.contains)) {
+          return;
+        }
+        // UIKit has already moved its row. Reloading the detail during its
+        // move animation would disturb the displayed cells.
+        await ref
+            .read(appSettingsProvider.notifier)
+            .setInlineMessageActions(ordered);
+        return;
+      }
+      if (event.id == 'message-actions-automatic' && value is bool) {
+        await ref
+            .read(appSettingsProvider.notifier)
+            .setInlineMessageActions(
+              value ? null : defaultInlineMessageActions,
+            );
+        await ref
+            .read(nativeSheetHydrationServiceProvider)
+            .hydrateDetail('message-actions');
+        return;
+      }
+      if (event.id == 'message-actions-reset') {
+        await ref
+            .read(appSettingsProvider.notifier)
+            .setInlineMessageActions(null);
+        await ref
+            .read(nativeSheetHydrationServiceProvider)
+            .hydrateDetail('message-actions');
+        return;
+      }
+      if (event.id.startsWith('message-action:') && value is bool) {
+        final id = event.id.substring('message-action:'.length);
+        final context = NavigationService.context;
+        if (context == null ||
+            !context.mounted ||
+            !messageActionSettings(AppLocalizations.of(context)!)
+                .any((action) => action.id == id)) {
+          return;
+        }
+        await ref
+            .read(appSettingsProvider.notifier)
+            .setMessageActionVisible(id, value);
+        await ref
+            .read(nativeSheetHydrationServiceProvider)
+            .hydrateDetail('message-actions');
+        return;
+      }
+
+      if (event.id.startsWith('quick-pill:')) {
+        final pillId = event.id.substring('quick-pill:'.length);
+        if (value is! bool) return;
+        final tools = ref
+            .read(toolsListProvider)
+            .maybeWhen(data: (v) => v, orElse: () => const <Tool>[]);
+        final selectedModel = ref.read(selectedModelProvider);
+        final allowed = <String>{
+          'web',
+          'image',
+          ...tools.map((t) => t.id),
+          ...(selectedModel?.filters ?? const []).map((f) => 'filter:${f.id}'),
+        };
+        if (!allowed.contains(pillId)) return;
+        final current = List<String>.from(
+          ref.read(appSettingsProvider).quickPills,
+        );
+        if (value) {
+          if (!current.contains(pillId)) current.add(pillId);
+        } else {
+          current.remove(pillId);
+        }
+        await ref.read(appSettingsProvider.notifier).setQuickPills(current);
+        return;
+      }
+
+      if (event.id.startsWith('model-system-prompt:')) {
+        final encoded = event.id.substring('model-system-prompt:'.length);
+        final modelId = Uri.decodeComponent(encoded);
+        if (value is! String) return;
+        final api = ref.read(apiServiceProvider);
+        if (api == null) return;
+        await api.updateModelSystemPrompt(modelId, value);
+        await ref.read(modelsProvider.notifier).refresh();
+        return;
+      }
+
+      switch (event.id) {
+        case NativeSheetRoutes.hermes:
+          unawaited(
+            NavigationService.router.pushNamed<void>(
+              RouteNames.hermesSettings,
+              extra: const NativeSheetNavigationOrigin(),
+            ),
+          );
+        case NativeSheetRoutes.workspace:
+          final capabilities = ref.read(workspaceCapabilitiesProvider).value;
+          final permitted = capabilities == null
+              ? const <WorkspaceSection>[]
+              : permittedWorkspaceSections(capabilities);
+          final destination = permitted.isEmpty
+              ? Routes.workspace
+              : permitted.first.path;
+          unawaited(
+            NavigationService.router.push<void>(
+              destination,
+              extra: const NativeSheetNavigationOrigin(),
+            ),
+          );
+        case 'default-model':
+          if (value is String) {
+            final modelId = value == 'auto-select' ? null : value;
+            await ref
+                .read(appSettingsProvider.notifier)
+                .setDefaultModel(modelId);
+            await restoreDefaultModel(ref);
+          }
+        case 'default-image-generation-model':
+          if (value is String) {
+            await ref
+                .read(appSettingsProvider.notifier)
+                .setOpenRouterImageGenerationModel(value);
+          }
+        case 'voice-barge-in':
+          if (value is bool) {
+            await ref
+                .read(appSettingsProvider.notifier)
+                .setVoiceBargeInEnabled(value);
+          }
+        case 'stt-silence-duration':
+          final ms = switch (value) {
+            final int i => i,
+            final double d => d.round(),
+            _ => int.tryParse('$value'),
+          };
+          if (ms != null) {
+            await ref
+                .read(appSettingsProvider.notifier)
+                .setVoiceSilenceDuration(ms);
+          }
+        case 'tts-speech-rate':
+          final rate = switch (value) {
+            final double d => d,
+            final int i => i.toDouble(),
+            _ => double.tryParse('$value'),
+          };
+          if (rate != null) {
+            await ref.read(appSettingsProvider.notifier).setTtsSpeechRate(rate);
+          }
+        case 'tts-preview':
+          final text = value is String ? value : null;
+          if (text == null || text.isEmpty) return;
+          final controller = ref.read(textToSpeechControllerProvider.notifier);
+          final speechState = ref.read(textToSpeechControllerProvider);
+          if (speechState.isSpeaking || speechState.isBusy) {
+            await controller.stop();
+          } else {
+            await controller.toggleForMessage(
+              messageId: 'tts_preview',
+              text: text,
+            );
+          }
+        case 'memory-add-content':
+          if (value is String && value.trim().isNotEmpty) {
+            await _runNativeMemoryAction(
+              (memories, owner) => memories.add(value.trim(), owner: owner),
+            );
+          }
+        case 'memory-clear-all':
+          await _runNativeMemoryAction(
+            (memories, owner) => memories.clearAll(owner: owner),
+          );
+        case 'memory-enabled':
+          if (value is bool) {
+            await ref
+                .read(personalizationSettingsProvider.notifier)
+                .setMemoryEnabled(value);
+          }
+        case 'system-prompt':
+          if (value is String) {
+            await ref
+                .read(personalizationSettingsProvider.notifier)
+                .setSystemPrompt(value);
+          }
+        case 'stt-engine':
+          if (value == SttPreference.serverOnly.name) {
+            await ref
+                .read(appSettingsProvider.notifier)
+                .setSttPreference(SttPreference.serverOnly);
+            await _refreshNativeVoiceDetail();
+          } else if (value == SttPreference.deviceOnly.name) {
+            await ref
+                .read(appSettingsProvider.notifier)
+                .setSttPreference(SttPreference.deviceOnly);
+            await _refreshNativeVoiceDetail();
+          }
+        case 'stt-language-code':
+          if (value is String) {
+            final normalized = SettingsService.normalizeSttLanguageCode(value);
+            if (normalized != null ||
+                SettingsService.isSttLanguageAutoInput(value)) {
+              await ref
+                  .read(appSettingsProvider.notifier)
+                  .setSttLanguageCode(normalized);
+              await _refreshNativeVoiceDetail();
+            } else {
+              DebugLogger.validation(
+                'Ignoring invalid native STT language code',
+                scope: 'native/sheet',
+                data: {'value': value},
+              );
+              await _refreshNativeVoiceDetail();
+            }
+          }
+        case 'tts-engine':
+          final notifier = ref.read(appSettingsProvider.notifier);
+          if (value == TtsEngine.server.name) {
+            await notifier.setTtsEngineSelection(TtsEngine.server);
+            await _refreshNativeVoiceDetail();
+          } else if (value == TtsEngine.device.name) {
+            await notifier.setTtsEngineSelection(TtsEngine.device);
+            await _refreshNativeVoiceDetail();
+          }
+        case 'voice-call-mode':
+          final mode = VoiceCallMode.values
+              .where((mode) => mode.name == value)
+              .firstOrNull;
+          if (mode != null) {
+            await ref.read(appSettingsProvider.notifier).setVoiceCallMode(mode);
+            await _refreshNativeVoiceDetail();
+          }
+        case 'voice-provider-connection':
+          if (value is String) {
+            await _chooseNativeVoiceProvider(value);
+            await _refreshNativeVoiceDetail(NativeSheetRoutes.voiceProvider);
+          }
+        case final id when nativeVoiceProviderFieldIds.containsKey(id):
+          final current = ref.read(appSettingsProvider).directVoiceProvider;
+          if (value is String && current != null) {
+            await ref
+                .read(appSettingsProvider.notifier)
+                .setDirectVoiceProvider(
+                  current.withField(nativeVoiceProviderFieldIds[id]!, value),
+                );
+            await _refreshNativeVoiceDetail(NativeSheetRoutes.voiceProvider);
+          }
+        case 'theme-light':
+          switch (value) {
+            case 'system':
+              ref
+                  .read(appThemeModeProvider.notifier)
+                  .setTheme(ThemeMode.system);
+            case 'light':
+              ref.read(appThemeModeProvider.notifier).setTheme(ThemeMode.light);
+            case 'dark':
+              ref.read(appThemeModeProvider.notifier).setTheme(ThemeMode.dark);
+          }
+        case 'language':
+          if (value == 'system') {
+            await ref.read(appLocaleProvider.notifier).setLocale(null);
+          } else if (value is String && value.isNotEmpty) {
+            final locale = _localeFromNativeTag(value);
+            if (locale != null) {
+              await ref.read(appLocaleProvider.notifier).setLocale(locale);
+            }
+          }
+        case 'theme-palette':
+          if (value is String && value.isNotEmpty) {
+            await ref.read(appThemePaletteProvider.notifier).setPalette(value);
+          }
+        case 'quick-pills-clear':
+          await ref.read(appSettingsProvider.notifier).setQuickPills(const []);
+        case 'composer-notes-button':
+          if (value is bool) {
+            await ref
+                .read(appSettingsProvider.notifier)
+                .setShowComposerNotesButton(value);
+          }
+        case 'send-on-enter':
+          if (value is bool) {
+            await ref.read(appSettingsProvider.notifier).setSendOnEnter(value);
+          }
+        case 'temporary-chat-default':
+          if (value is bool) {
+            await ref
+                .read(appSettingsProvider.notifier)
+                .setTemporaryChatByDefault(value);
+          }
+        case nativeAdvancedFeaturesId:
+          if (value is bool) {
+            await ref
+                .read(appSettingsProvider.notifier)
+                .setAdvancedFeaturesEnabled(value);
+            final hydration = ref.read(nativeSheetHydrationServiceProvider);
+            await hydration.hydrateDetail(NativeSheetRoutes.chats);
+            // The Settings root under this page lists what Advanced reveals,
+            // so it gains or loses those rows before the user goes back.
+            await hydration.refreshProfileRoot();
+          }
+        case nativeCitationShowTitlesId:
+          if (value is bool) {
+            await ref
+                .read(appSettingsProvider.notifier)
+                .setCitationShowTitles(value);
+          }
+        case nativeCitationBackgroundId:
+          if (value is bool) {
+            await ref
+                .read(appSettingsProvider.notifier)
+                .setCitationBackground(value);
+          }
+        case 'disable-haptics-streaming':
+          if (value is bool) {
+            await ref
+                .read(appSettingsProvider.notifier)
+                .setDisableHapticsWhileStreaming(value);
+          }
+        case 'notifications-enabled':
+          if (value is bool) {
+            await ref
+                .read(appSettingsProvider.notifier)
+                .setNotificationsEnabled(value);
+            _syncNotificationPrefsToServer(enabled: value);
+            if (value) {
+              // Best-effort OS permission on opt-in; OS governs delivery.
+              await ref
+                  .read(localNotificationServiceProvider)
+                  .requestPermissions();
+            }
+          }
+        case 'notification-in-app-banner':
+          if (value is bool) {
+            await ref
+                .read(appSettingsProvider.notifier)
+                .setNotificationInAppBanner(value);
+          }
+        case 'notification-system':
+          if (value is bool) {
+            await ref
+                .read(appSettingsProvider.notifier)
+                .setNotificationSystem(value);
+          }
+        case 'notification-sound':
+          if (value is bool) {
+            await ref
+                .read(appSettingsProvider.notifier)
+                .setNotificationSound(value);
+            _syncNotificationPrefsToServer(sound: value);
+          }
+        case 'notification-sound-always':
+          if (value is bool) {
+            await ref
+                .read(appSettingsProvider.notifier)
+                .setNotificationSoundAlways(value);
+            _syncNotificationPrefsToServer(soundAlways: value);
+          }
+        case 'notification-chat':
+          if (value is bool) {
+            await ref
+                .read(appSettingsProvider.notifier)
+                .setNotificationChatEnabled(value);
+          }
+        case 'notification-channel':
+          if (value is bool) {
+            await ref
+                .read(appSettingsProvider.notifier)
+                .setNotificationChannelEnabled(value);
+          }
+        case 'transport-auto':
+          await ref
+              .read(appSettingsProvider.notifier)
+              .setSocketTransportMode('auto');
+        case 'transport-streaming':
+          await ref
+              .read(appSettingsProvider.notifier)
+              .setSocketTransportMode('ws');
+        case 'transport-mode':
+          if (value == 'ws' || value == 'streaming') {
+            await ref
+                .read(appSettingsProvider.notifier)
+                .setSocketTransportMode('ws');
+          } else if (value == 'polling' || value == 'auto') {
+            await ref
+                .read(appSettingsProvider.notifier)
+                .setSocketTransportMode('auto');
+          }
+        case 'current-password':
+        case 'new-password':
+        case 'confirm-password':
+          await _saveNativePasswordDraft(event.id, value);
+      }
+    } catch (error, stackTrace) {
+      DebugLogger.error(
+        'native-sheet-control-failed',
+        scope: 'native/sheet',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    }
+  }
+
+  String? _normalizeOptionalNativeText(String? value) {
+    final trimmed = value?.trim();
+    return trimmed == null || trimmed.isEmpty ? null : trimmed;
+  }
+
+  /// Makes the connection with [profileId] the Voice provider, or clears it.
+  Future<void> _chooseNativeVoiceProvider(String profileId) async {
+    final notifier = ref.read(appSettingsProvider.notifier);
+    if (profileId == nativeNoVoiceProviderId) {
+      await notifier.setDirectVoiceProvider(null);
+      return;
+    }
+    // Connections still loading are not gone: the choice waits for them.
+    final profiles = ref.read(directConnectionProfilesProvider).value;
+    if (profiles == null) return;
+    final profile = profiles
+        .where(canBeVoiceProvider)
+        .where((profile) => profile.id == profileId)
+        .firstOrNull;
+    await notifier.setDirectVoiceProvider(
+      profile == null
+          ? null
+          : DirectVoiceProviderSettings.forConnection(
+              profile,
+              current: ref.read(appSettingsProvider).directVoiceProvider,
+            ),
+    );
+  }
+
+  /// Redraws the Voice pages from [detailId], the one the change came from.
+  Future<void> _refreshNativeVoiceDetail([
+    String detailId = NativeSheetRoutes.voice,
+  ]) {
+    return ref
+        .read(nativeSheetHydrationServiceProvider)
+        .hydrateDetail(detailId);
+  }
+
+  Future<void> _saveNativePasswordDraft(String id, Object? value) async {
+    if (value is! String) return;
+    _nativeSheetDraftValues[id] = value;
+
+    final current = _nativeSheetDraftValues['current-password'];
+    final next = _nativeSheetDraftValues['new-password'];
+    final confirm = _nativeSheetDraftValues['confirm-password'];
+    if (current == null ||
+        current.isEmpty ||
+        next == null ||
+        next.isEmpty ||
+        confirm == null ||
+        confirm.isEmpty) {
+      return;
+    }
+    if (confirm != next) {
+      return;
+    }
+
+    await ref
+        .read(accountProfileProvider.notifier)
+        .updatePassword(password: current, newPassword: next);
+    _nativeSheetDraftValues.remove('current-password');
+    _nativeSheetDraftValues.remove('new-password');
+    _nativeSheetDraftValues.remove('confirm-password');
+  }
+
+  Future<void> _showManualReleaseNotes(BuildContext context) async {
+    final packageInfo = await ref.read(packageInfoProvider.future);
+    if (!context.mounted) return;
+
+    final allNotes = await const ReleaseNotesRepository().load(
+      Localizations.localeOf(context),
+    );
+    if (!context.mounted) return;
+    final notes = latestBundledReleaseNotesForVersion(
+      currentVersion: packageInfo.version,
+      notes: allNotes,
+    );
+    if (notes.isEmpty) return;
+
+    await showReleaseNotesSheet(
+      context: context,
+      currentVersion: packageInfo.version,
+      notes: notes,
+    );
+  }
+
+  /// Runs a memory action from the native Memory list for the account that
+  /// list was built for. With no list on record, or once the account has
+  /// changed, nothing is sent.
+  Future<void> _runNativeMemoryAction(
+    Future<void> Function(UserMemories memories, MemoryOwner owner) action,
+  ) async {
+    final owner = ref.read(nativeSheetHydrationServiceProvider).memoryOwner;
+    if (owner == null) return;
+    await action(ref.read(userMemoriesProvider.notifier), owner);
+  }
+
+  /// Opens the Flutter Notifications page, where webhook destinations live, once
+  /// the native sheet has closed. It is entered with the native-sheet origin so
+  /// the page does not slide over the sheet that just left. Nothing is sent from
+  /// here: the page captures the account when an action in it opens, so this
+  /// only has to keep a stale or denied row from navigating.
+  void _openNativeNotificationTargets() {
+    final advanced = ref.read(appSettingsProvider).advancedFeaturesEnabled;
+    if (!advanced || !ref.read(notificationTargetsAvailableProvider)) {
+      _showNativeOptionUnavailable();
+      return;
+    }
+    unawaited(
+      NavigationService.router.pushNamed<void>(
+        RouteNames.notificationSettings,
+        extra: const NativeSheetNavigationOrigin(),
+      ),
+    );
+  }
+
+  /// Opens the Flutter memory editor, which the native sheet cannot match with
+  /// its type and path fields, over the app once the native sheet has closed.
+  Future<void> _openNativeMemoryEditor(String actionId) async {
+    final memories = ref.read(userMemoriesProvider.notifier);
+    final owner = ref.read(nativeSheetHydrationServiceProvider).memoryOwner;
+    final permitted = ref
+        .read(memoriesPermittedProvider)
+        .maybeWhen(data: (permitted) => permitted, orElse: () => true);
+    if (owner == null || !permitted) return;
+
+    ServerMemory? memory;
+    if (actionId != nativeMemoryEditorNewActionId) {
+      final id = Uri.decodeComponent(
+        actionId.substring(nativeMemoryEditorActionPrefix.length),
+      );
+      memory = ref
+          .read(userMemoriesProvider)
+          .asData
+          ?.value
+          .where((candidate) => candidate.id == id)
+          .firstOrNull;
+      if (memory == null) return;
+    }
+
+    final context = NavigationService.context;
+    if (context == null || !context.mounted) return;
+    await showMemoryEditor(
+      context,
+      notifier: memories,
+      owner: owner,
+      advanced: ref.read(appSettingsProvider).advancedFeaturesEnabled,
+      memory: memory,
+    );
+  }
+
+  /// Says why a row tapped in the native sheet did nothing: it went away
+  /// while the sheet was open (Advanced turned off, the account lost access).
+  /// The sheet has already closed, so the message shows over the app.
+  void _showNativeOptionUnavailable() {
+    final context = NavigationService.context;
+    if (context == null || !context.mounted) return;
+    final l10n = AppLocalizations.of(context);
+    if (l10n == null) return;
+    UiUtils.showMessage(context, l10n.nativeSheetOptionUnavailable);
+  }
+
+  Future<void> _handleNativeTtsVoicePick(
+    NativeSheetControlChanged event,
+  ) async {
+    final encoded = event.id.substring('tts-voice-pick:'.length);
+    final voiceKey = Uri.decodeComponent(encoded);
+    final fallbackDisplayName = event.value is String
+        ? event.value as String
+        : null;
+    await _handleNativeTtsVoiceSelection(
+      voiceKey == '__default__' ? ttsSystemDefaultVoiceId : voiceKey,
+      fallbackDisplayName: fallbackDisplayName,
+    );
+  }
+
+  Future<void> _handleNativeTtsVoiceSelection(
+    String voiceKey, {
+    String? fallbackDisplayName,
+  }) async {
+    final settings = ref.read(appSettingsProvider);
+    final notifier = ref.read(appSettingsProvider.notifier);
+
+    if (voiceKey == ttsSystemDefaultVoiceId) {
+      if (settings.ttsEngine == TtsEngine.server) {
+        await notifier.setTtsServerVoiceSelection(null, null);
+      } else {
+        await notifier.setTtsDeviceVoiceSelection(null, null);
+      }
+      await _refreshNativeVoiceDetail();
+      return;
+    }
+
+    var selectedId = voiceKey;
+    var displayName = fallbackDisplayName ?? voiceKey;
+    final l10n = currentAppLocalizations();
+    try {
+      final ttsService = ref.read(textToSpeechServiceProvider);
+      await ttsService.updateSettings(engine: settings.ttsEngine);
+      final voices = await ttsService.getAvailableVoices();
+      final selected = findTtsVoiceOption(
+        l10n,
+        settings.ttsEngine,
+        voices,
+        voiceKey,
+      );
+      if (selected != null) {
+        selectedId = selected.id;
+        displayName = selected.label;
+      }
+    } catch (error, stackTrace) {
+      DebugLogger.warning(
+        'native-tts-voice-selection-lookup-failed',
+        scope: 'native/sheet',
+        data: {'error': error, 'stackTrace': stackTrace},
+      );
+    }
+
+    if (settings.ttsEngine == TtsEngine.server) {
+      await notifier.setTtsServerVoiceSelection(selectedId, displayName);
+    } else {
+      await notifier.setTtsDeviceVoiceSelection(selectedId, displayName);
+    }
+    await _refreshNativeVoiceDetail();
+  }
+
+  void _initializeAppState() {
+    DebugLogger.auth('init', scope: 'app');
+    ref.read(appStartupFlowProvider.notifier).start();
+  }
+
+  @override
+  void dispose() {
+    _nativeSheetSubscription?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final themeMode = ref.watch(appThemeModeProvider.select((mode) => mode));
+    final router = ref.watch(goRouterProvider);
+    final locale = ref.watch(appLocaleProvider);
+    final lightTheme = ref.watch(appLightThemeProvider);
+    final darkTheme = ref.watch(appDarkThemeProvider);
+    final cupertinoLight = ref.watch(appCupertinoLightThemeProvider);
+    final cupertinoDark = ref.watch(appCupertinoDarkThemeProvider);
+
+    return AdaptiveApp.router(
+      routerConfig: router,
+      onGenerateTitle: (context) => AppLocalizations.of(context)!.appTitle,
+      materialLightTheme: lightTheme,
+      materialDarkTheme: darkTheme,
+      cupertinoLightTheme: cupertinoLight,
+      cupertinoDarkTheme: cupertinoDark,
+      themeMode: themeMode,
+      locale: locale,
+      localizationsDelegates: conduitLocalizationsDelegates,
+      supportedLocales: AppLocalizations.supportedLocales,
+      localeListResolutionCallback: (deviceLocales, supported) {
+        if (locale != null) return locale;
+        if (deviceLocales == null || deviceLocales.isEmpty) {
+          return supported.first;
+        }
+        final resolved = _resolveSupportedLocale(deviceLocales, supported);
+        return resolved ?? supported.first;
+      },
+      material: (_, _) =>
+          const MaterialAppData(debugShowCheckedModeBanner: false),
+      cupertino: (_, _) =>
+          const CupertinoAppData(debugShowCheckedModeBanner: false),
+      builder: (context, child) {
+        // Resolve brightness from themeMode rather than
+        // Theme.of(context) — on iOS, CupertinoApp's
+        // auto-generated Theme may not reflect themeMode.
+        final Brightness brightness;
+        switch (themeMode) {
+          case ThemeMode.dark:
+            brightness = Brightness.dark;
+          case ThemeMode.light:
+            brightness = Brightness.light;
+          case ThemeMode.system:
+            brightness = MediaQuery.platformBrightnessOf(context);
+        }
+        if (_lastAppliedOverlayBrightness != brightness) {
+          _lastAppliedOverlayBrightness = brightness;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!mounted) return;
+            applySystemUiOverlayStyleOnce(brightness: brightness);
+          });
+        }
+        final safeChild = child ?? const SizedBox.shrink();
+
+        // On iOS, AdaptiveApp creates CupertinoApp which
+        // doesn't propagate Material ThemeExtensions.
+        // Wrap with Theme to ensure all custom extensions
+        // (ConduitThemeExtension, AppColorTokens, etc.)
+        // are available via Theme.of(context) on every
+        // platform.
+        final materialTheme = brightness == Brightness.dark
+            ? darkTheme
+            : lightTheme;
+        final nativeTheme = materialTheme.extension<ConduitThemeExtension>();
+        if (nativeTheme != null) {
+          // Sheets share the grouped settings colors with the Flutter
+          // settings screens so both read as one surface system.
+          final isDarkSheet = brightness == Brightness.dark;
+          final sheetBackground = nativeTheme.groupedBackground;
+          final sheetSurface = nativeTheme.groupedSurface;
+          unawaited(
+            NativeSheetBridge.instance.syncTheme(
+              NativeSheetThemeConfig(
+                isDark: isDarkSheet,
+                backgroundArgb: sheetBackground.toARGB32(),
+                surfaceArgb: sheetSurface.toARGB32(),
+                elevatedSurfaceArgb: nativeTheme.surfaceContainerHighest
+                    .toARGB32(),
+                inputArgb: nativeTheme.inputBackground.toARGB32(),
+                foregroundArgb: nativeTheme.textPrimary.toARGB32(),
+                secondaryForegroundArgb: nativeTheme.textSecondary.toARGB32(),
+                iconArgb: nativeTheme.iconSecondary.toARGB32(),
+                borderArgb: nativeTheme.cardBorder.toARGB32(),
+                accentArgb: nativeTheme.buttonPrimary.toARGB32(),
+                onAccentArgb: nativeTheme.buttonPrimaryText.toARGB32(),
+                destructiveArgb: nativeTheme.error.toARGB32(),
+              ),
+            ),
+          );
+        }
+
+        return Theme(
+          data: materialTheme,
+          child: Builder(
+            builder: (context) => LegacyDesignCompatibility(
+              child: ReleaseNotesCoordinator(
+                child: _KeyboardDismissOnScroll(child: safeChild),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  bool _prefersTraditionalChinese(Locale deviceLocale) {
+    final script = deviceLocale.scriptCode?.toLowerCase();
+    if (script == 'hant') return true;
+
+    final country = deviceLocale.countryCode?.toUpperCase();
+    return country == 'TW' || country == 'HK' || country == 'MO';
+  }
+
+  Locale? _resolveSupportedLocale(
+    List<Locale>? deviceLocales,
+    Iterable<Locale> supported,
+  ) {
+    if (deviceLocales == null || deviceLocales.isEmpty) return null;
+
+    for (final device in deviceLocales) {
+      final prefersTraditional = _prefersTraditionalChinese(device);
+      final deviceLanguage = device.languageCode.toLowerCase();
+      final deviceScript = device.scriptCode?.toLowerCase();
+      final deviceCountry = device.countryCode?.toUpperCase();
+
+      // Pass 1: match language with script (or preferred Traditional)
+      for (final loc in supported) {
+        final languageMatches =
+            loc.languageCode.toLowerCase() == deviceLanguage;
+        if (!languageMatches) continue;
+
+        final locScript = loc.scriptCode?.toLowerCase();
+        final scriptMatches =
+            locScript != null &&
+            locScript.isNotEmpty &&
+            (locScript == deviceScript ||
+                (loc.languageCode == 'zh' &&
+                    locScript == 'hant' &&
+                    prefersTraditional));
+        if (!scriptMatches) continue;
+
+        final locCountry = loc.countryCode?.toUpperCase();
+        final countryMatches =
+            locCountry == null ||
+            locCountry.isEmpty ||
+            locCountry == deviceCountry;
+
+        if (countryMatches) {
+          return loc;
+        }
+      }
+
+      // Pass 2: prefer Traditional Chinese when applicable
+      if (prefersTraditional) {
+        for (final loc in supported) {
+          if (loc.languageCode == 'zh' && loc.scriptCode == 'Hant') {
+            return loc;
+          }
+        }
+      }
+
+      // Pass 3: language-only match
+      for (final loc in supported) {
+        if (loc.languageCode.toLowerCase() == deviceLanguage) {
+          return loc;
+        }
+      }
+    }
+
+    return null;
+  }
+}
+
+/// Dismisses the soft keyboard whenever the user scrolls.
+class _KeyboardDismissOnScroll extends StatelessWidget {
+  const _KeyboardDismissOnScroll({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return NotificationListener<UserScrollNotification>(
+      onNotification: (notification) {
+        if (notification.direction == ScrollDirection.idle) {
+          return false;
+        }
+        final focusedNode = FocusManager.instance.primaryFocus;
+        if (focusedNode != null && focusedNode.hasFocus) {
+          focusedNode.unfocus();
+        }
+        return false;
+      },
+      child: child,
+    );
+  }
+}

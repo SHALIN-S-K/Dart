@@ -1,0 +1,2385 @@
+import 'dart:async';
+
+import 'package:checks/checks.dart';
+import 'package:conduit_core/models/chat_message.dart';
+import 'package:conduit_core/models/conversation.dart';
+import 'package:conduit_core/models/message_voice.dart';
+import 'package:conduit_core/models/model.dart';
+import 'package:conduit_core/models/openwebui_chat_settings.dart'
+    show OpenWebUiChatSettingsAccess;
+import 'package:conduit_core/models/server_config.dart';
+import 'package:conduit_core/providers/app_providers.dart';
+import 'package:conduit_core/services/api_service.dart';
+import 'package:conduit_core/services/settings_service.dart';
+import 'package:conduit_core/services/worker_manager.dart';
+import 'package:conduit/features/chat/providers/assistant_response_builder_provider.dart';
+import 'package:conduit_core/features/chat/providers/chat_providers.dart';
+import 'package:conduit_core/features/chat/providers/queued_completion_provider.dart';
+import 'package:conduit_core/features/chat/providers/reasoning_effort_provider.dart'
+    show
+        LocalReasoningEfforts,
+        localReasoningEffortForModel,
+        localReasoningEffortsProvider;
+import 'package:conduit/features/chat/providers/text_to_speech_provider.dart';
+import 'package:conduit/features/chat/widgets/assistant_message_widget.dart';
+import 'package:conduit/features/chat/widgets/enhanced_attachment.dart';
+import 'package:conduit/features/chat/widgets/enhanced_image_attachment.dart';
+import 'package:conduit/features/chat/widgets/follow_up_suggestions.dart';
+import 'package:conduit/features/chat/widgets/streaming_status_widget.dart';
+import 'package:conduit/features/chat/widgets/sources/openwebui_sources.dart';
+import 'package:conduit/l10n/app_localizations.dart';
+import 'package:conduit/l10n/conduit_localizations.dart';
+import 'package:conduit/shared/theme/app_theme.dart';
+import 'package:conduit/shared/theme/tweakcn_themes.dart';
+import 'package:conduit/shared/widgets/chat_action_button.dart';
+import 'package:conduit/shared/widgets/markdown/streaming_markdown_widget.dart';
+import 'package:conduit/shared/widgets/platform_ui/platform_ui.dart';
+import 'package:flutter/foundation.dart' show SynchronousFuture;
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_riverpod/misc.dart' show Override;
+import 'package:flutter_test/flutter_test.dart';
+
+class _TestTextToSpeechController extends TextToSpeechController {
+  @override
+  TextToSpeechState build() => const TextToSpeechState();
+}
+
+class _RecordingTextToSpeechController extends TextToSpeechController {
+  _RecordingTextToSpeechController(this.onToggle);
+
+  final VoidCallback onToggle;
+
+  @override
+  TextToSpeechState build() =>
+      const TextToSpeechState(initialized: true, available: true);
+
+  @override
+  Future<void> toggleForMessage({
+    required String messageId,
+    required String text,
+  }) async {
+    onToggle();
+  }
+}
+
+/// Runs worker tasks inline so the TTS plain-text pass resolves within a pump.
+class _ImmediateWorkerManager extends WorkerManager {
+  _ImmediateWorkerManager() : super(maxConcurrentTasks: 1);
+
+  @override
+  Future<R> schedule<Q, R>(
+    WorkerTask<Q, R> callback,
+    Q message, {
+    String? debugLabel,
+  }) => Future<R>.value(callback(message));
+}
+
+class _CapturingTextToSpeechController extends TextToSpeechController {
+  _CapturingTextToSpeechController(this.onToggle);
+
+  final void Function(String text) onToggle;
+
+  @override
+  TextToSpeechState build() =>
+      const TextToSpeechState(initialized: true, available: true);
+
+  @override
+  Future<void> toggleForMessage({
+    required String messageId,
+    required String text,
+  }) async {
+    onToggle(text);
+  }
+}
+
+final class _PendingImageProvider extends ImageProvider<_PendingImageProvider> {
+  @override
+  Future<_PendingImageProvider> obtainKey(ImageConfiguration configuration) {
+    return SynchronousFuture(this);
+  }
+
+  @override
+  ImageStreamCompleter loadImage(
+    _PendingImageProvider key,
+    ImageDecoderCallback decode,
+  ) {
+    return OneFrameImageStreamCompleter(Completer<ImageInfo>().future);
+  }
+}
+
+class _CountingTextToSpeechController extends TextToSpeechController {
+  _CountingTextToSpeechController(this.onBuild);
+
+  final VoidCallback onBuild;
+
+  @override
+  TextToSpeechState build() {
+    onBuild();
+    return const TextToSpeechState();
+  }
+}
+
+Widget _buildHarness(Widget child) {
+  return MaterialApp(
+    theme: AppTheme.light(TweakcnThemes.t3Chat),
+    localizationsDelegates: conduitLocalizationsDelegates,
+    supportedLocales: AppLocalizations.supportedLocales,
+    home: Scaffold(body: child),
+  );
+}
+
+Widget _buildAssistantHarness(
+  ChatMessage message, {
+  bool showFollowUps = false,
+  bool isStreaming = false,
+  bool? isChatStreaming,
+  bool disableAnimations = false,
+  bool showActionBar = true,
+  bool readOnly = false,
+  AppSettings? settings,
+  String Function()? resolveGroupedResponseText,
+  VoidCallback? onCopy,
+  VoidCallback? onRegenerate,
+  FutureOr<void> Function(String suggestion)? onFollowUpSelected,
+  Locale? locale,
+}) {
+  return ProviderScope(
+    overrides: [
+      if (settings != null) appSettingsProvider.overrideWithValue(settings),
+      textToSpeechControllerProvider.overrideWith(
+        _TestTextToSpeechController.new,
+      ),
+      streamingHapticsEnabledProvider.overrideWithValue(false),
+      if (isChatStreaming != null)
+        isChatStreamingProvider.overrideWithValue(isChatStreaming),
+    ],
+    child: MaterialApp(
+      theme: AppTheme.light(TweakcnThemes.t3Chat),
+      locale: locale,
+      localizationsDelegates: conduitLocalizationsDelegates,
+      supportedLocales: AppLocalizations.supportedLocales,
+      builder: (context, child) => MediaQuery(
+        data: MediaQuery.of(context)
+            .copyWith(disableAnimations: disableAnimations),
+        child: child!,
+      ),
+      home: Scaffold(
+        body: AssistantMessageWidget(
+          message: message,
+          isStreaming: isStreaming,
+          showFollowUps: showFollowUps,
+          showActionBar: showActionBar,
+          readOnly: readOnly,
+          resolveGroupedResponseText: resolveGroupedResponseText,
+          animateOnMount: false,
+          modelName: message.model,
+          onCopy: onCopy ?? () {},
+          onRegenerate: onRegenerate ?? () {},
+          onDelete: () {},
+          onFollowUpSelected: onFollowUpSelected,
+        ),
+      ),
+    ),
+  );
+}
+
+bool _hasInProgressFadeAncestor(WidgetTester tester, Finder childFinder) {
+  final fadeFinder = find.ancestor(
+    of: childFinder,
+    matching: find.byType(FadeTransition),
+  );
+  return tester
+      .widgetList<FadeTransition>(fadeFinder)
+      .any((fade) => fade.opacity.value < 1);
+}
+
+Future<void> _tapVersionControl(
+  WidgetTester tester, {
+  required IconData visibleIcon,
+  required String overflowLabel,
+}) async {
+  final visibleFinder = find.byIcon(visibleIcon);
+  if (visibleFinder.evaluate().isNotEmpty) {
+    await tester.tap(visibleFinder);
+    await tester.pumpAndSettle();
+    return;
+  }
+
+  await tester.tap(find.byIcon(Icons.more_horiz_rounded));
+  await tester.pumpAndSettle();
+  await tester.tap(find.text(overflowLabel));
+  await tester.pumpAndSettle();
+}
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  tearDown(PlatformUiCapabilities.resetDebugOverrides);
+
+  group('response sharing', () {
+    const channel = MethodChannel('dev.fluttercommunity.plus/share');
+    final calls = <MethodCall>[];
+    var failShare = false;
+    const text = '## Garden plan\n\n- Plant basil.\n- Water gently.\n\n`done`';
+    final message = ChatMessage(
+      id: 'share-response',
+      role: 'assistant',
+      content: text,
+      timestamp: DateTime.utc(2026, 1, 1),
+      versions: [
+        ChatMessageVersion(
+          id: 'earlier-response',
+          content: 'Earlier garden plan.',
+          timestamp: DateTime.utc(2025, 12, 31),
+        ),
+      ],
+    );
+
+    setUp(() {
+      calls.clear();
+      failShare = false;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+            calls.add(call);
+            if (failShare) throw PlatformException(code: 'share-failed');
+            return 'dev.fluttercommunity.plus/share/dismissed';
+          });
+    });
+    tearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, null);
+    });
+
+    Future<void> share(WidgetTester tester) async {
+      await tester.tap(
+        find.byKey(const ValueKey('assistant-response-overflow-button')),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Share...'));
+      await tester.pumpAndSettle();
+    }
+
+    for (final readOnly in [false, true]) {
+      testWidgets('shares only response text; readOnly=$readOnly', (
+        tester,
+      ) async {
+        await tester.binding.setSurfaceSize(const Size(1024, 768));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+        await tester.pumpWidget(
+          _buildAssistantHarness(message, readOnly: readOnly),
+        );
+        await tester.pumpAndSettle();
+
+        check(find.byIcon(Icons.share_outlined).evaluate()).isEmpty();
+        final origin = tester.getRect(
+          find.byKey(const ValueKey('assistant-response-overflow-button')),
+        );
+        await share(tester);
+
+        check(calls).length.equals(1);
+        check(calls.single.method).equals('share');
+        final args = calls.single.arguments as Map;
+        check(args['text']).equals(text);
+        check(args['paths']).isNull();
+        check(args['originX']).equals(origin.left);
+        check(args['originY']).equals(origin.top);
+        check(args['originWidth']).equals(origin.width);
+        check(args['originHeight']).equals(origin.height);
+        check(find.text('Something went wrong. Please try again.').evaluate())
+            .isEmpty();
+      });
+    }
+
+    testWidgets('shares a whole grouped answer or the previewed version', (
+      tester,
+    ) async {
+      const grouped = 'First part.\n\nLast part.';
+      await tester.pumpWidget(
+        _buildAssistantHarness(
+          message,
+          resolveGroupedResponseText: () => grouped,
+        ),
+      );
+      await tester.pumpAndSettle();
+      await share(tester);
+      check((calls.single.arguments as Map)['text']).equals(grouped);
+
+      await _tapVersionControl(
+        tester,
+        visibleIcon: Icons.chevron_left,
+        overflowLabel: 'Prev',
+      );
+      await share(tester);
+      check((calls.last.arguments as Map)['text'])
+          .equals('Earlier garden plan.');
+    });
+
+    testWidgets('omits internal tool markup using the clipboard text rules', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        _buildAssistantHarness(
+          message.copyWith(
+            content:
+                'Visible &amp; useful.\n\n'
+                '<details type="tool_calls">Synthetic tool payload</details>',
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await share(tester);
+      check((calls.single.arguments as Map)['text'])
+          .equals('Visible & useful.');
+    });
+
+    testWidgets('shares grouped text when the final row has no text', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        _buildAssistantHarness(
+          message.copyWith(content: '', metadata: const {'responseDone': true}),
+          resolveGroupedResponseText: () => text,
+        ),
+      );
+      await tester.pumpAndSettle();
+      await share(tester);
+      check((calls.single.arguments as Map)['text']).equals(text);
+    });
+
+    for (final grouped in [false, true]) {
+      testWidgets('does not offer Share when only reasoning remains; '
+          'grouped=$grouped', (tester) async {
+        const reasoning =
+            '<details type="reasoning" done="true" duration="2">\n'
+            '<summary>Thought for 2 seconds</summary>\n'
+            '&gt; Weighing the garden plan.\n'
+            '</details>';
+        await tester.pumpWidget(
+          _buildAssistantHarness(
+            message.copyWith(content: reasoning),
+            resolveGroupedResponseText: grouped
+                ? () => '$reasoning\n\n$reasoning'
+                : null,
+          ),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(
+          find.byKey(const ValueKey('assistant-response-overflow-button')),
+        );
+        await tester.pumpAndSettle();
+        check(find.text('Delete').evaluate()).isNotEmpty();
+        check(find.text('Share...').evaluate()).isEmpty();
+      });
+    }
+
+    testWidgets('does not offer Share while the response is streaming', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        _buildAssistantHarness(
+          message.copyWith(isStreaming: true),
+          isStreaming: true,
+          isChatStreaming: true,
+        ),
+      );
+      await tester.pumpAndSettle();
+      check(
+        find
+            .byKey(const ValueKey('assistant-response-overflow-button'))
+            .evaluate(),
+      ).isEmpty();
+      check(calls).isEmpty();
+    });
+
+    testWidgets('reports a platform share failure', (tester) async {
+      failShare = true;
+      await tester.pumpWidget(_buildAssistantHarness(message));
+      await tester.pumpAndSettle();
+      await share(tester);
+      check(find.text('Something went wrong. Please try again.').evaluate())
+          .isNotEmpty();
+      check(tester.takeException()).isNull();
+    });
+  });
+
+  group('copying a previewed version', () {
+    final copied = <Object?>[];
+    var failCopy = false;
+    final message = ChatMessage(
+      id: 'copy-version',
+      role: 'assistant',
+      content: 'Latest garden plan.',
+      timestamp: DateTime.utc(2026, 1, 1),
+      versions: [
+        ChatMessageVersion(
+          id: 'earlier-response',
+          content: 'Earlier &amp; gentler plan.',
+          timestamp: DateTime.utc(2025, 12, 31),
+        ),
+      ],
+    );
+
+    setUp(() {
+      copied.clear();
+      failCopy = false;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(SystemChannels.platform, (call) async {
+            if (call.method == 'Clipboard.setData') {
+              if (failCopy) throw PlatformException(code: 'copy-failed');
+              copied.add((call.arguments as Map)['text']);
+            }
+            return null;
+          });
+    });
+    tearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(SystemChannels.platform, null);
+    });
+
+    Future<void> copyEarlierVersion(WidgetTester tester) async {
+      await _tapVersionControl(
+        tester,
+        visibleIcon: Icons.chevron_left,
+        overflowLabel: 'Prev',
+      );
+      await tester.tap(find.byIcon(Icons.content_copy_outlined));
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('copies the version on screen, not the latest answer', (
+      tester,
+    ) async {
+      var parentCopies = 0;
+      await tester.pumpWidget(
+        _buildAssistantHarness(message, onCopy: () => parentCopies++),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byIcon(Icons.content_copy_outlined));
+      await tester.pump();
+      check(parentCopies).equals(1);
+      check(copied).isEmpty();
+
+      await copyEarlierVersion(tester);
+      check(parentCopies).equals(1);
+      check(copied).deepEquals(['Earlier & gentler plan.']);
+    });
+
+    testWidgets('reports a failed copy', (tester) async {
+      failCopy = true;
+      await tester.pumpWidget(_buildAssistantHarness(message));
+      await tester.pumpAndSettle();
+      await copyEarlierVersion(tester);
+      check(find.text('Something went wrong. Please try again.').evaluate())
+          .isNotEmpty();
+      check(tester.takeException()).isNull();
+    });
+  });
+
+  testWidgets('streaming content rebuilds only the assistant body', (
+    tester,
+  ) async {
+    final container = ProviderContainer(
+      overrides: [
+        textToSpeechControllerProvider.overrideWith(
+          _TestTextToSpeechController.new,
+        ),
+        streamingHapticsEnabledProvider.overrideWithValue(false),
+      ],
+    );
+    addTearDown(container.dispose);
+    var shellBuilds = 0;
+    var contentBuilds = 0;
+    final message = ChatMessage(
+      id: 'streaming-rebuild-boundary',
+      role: 'assistant',
+      content: '',
+      timestamp: DateTime(2024, 1, 1),
+      isStreaming: true,
+    );
+
+    await tester.pumpWidget(
+      UncontrolledProviderScope(
+        container: container,
+        child: MaterialApp(
+          theme: AppTheme.light(TweakcnThemes.t3Chat),
+          localizationsDelegates: conduitLocalizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: Scaffold(
+            body: AssistantMessageWidget(
+              message: message,
+              isStreaming: true,
+              showFollowUps: false,
+              animateOnMount: false,
+              suppressStreamingHaptics: true,
+              onDelete: () {},
+              debugOnShellBuild: () => shellBuilds += 1,
+              debugOnStreamingContentBuild: () => contentBuilds += 1,
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    container
+        .read(streamingContentProvider.notifier)
+        .set('First visible streaming batch');
+    await tester.pump();
+    await tester.pump();
+
+    // The empty/non-empty boundary may rebuild once to dismiss queued/empty
+    // shell states. Subsequent token batches must stay inside the body.
+    final shellBuildsAfterFirstContent = shellBuilds;
+    final contentBuildsAfterFirstContent = contentBuilds;
+    container
+        .read(streamingContentProvider.notifier)
+        .set('First visible streaming batch with more text');
+    await tester.pump();
+    await tester.pump();
+
+    expect(shellBuilds, shellBuildsAfterFirstContent);
+    expect(contentBuilds, greaterThan(contentBuildsAfterFirstContent));
+    expect(
+      find.textContaining(
+        'First visible streaming batch with more text',
+        findRichText: true,
+      ),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('source chip opens a details bottom sheet', (tester) async {
+    const sources = <ChatSourceReference>[
+      ChatSourceReference(
+        title: 'OpenAI Research',
+        snippet: 'A first source summary for the sheet.',
+      ),
+      ChatSourceReference(
+        title: 'API Docs',
+        snippet: 'A second source summary for the sheet.',
+      ),
+    ];
+
+    await tester.pumpWidget(
+      _buildHarness(
+        const Center(child: OpenWebUISourcesWidget(sources: sources)),
+      ),
+    );
+
+    expect(find.text('2 Sources'), findsOneWidget);
+
+    await tester.tap(find.text('2 Sources'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('OpenAI Research'), findsOneWidget);
+    expect(find.text('A first source summary for the sheet.'), findsOneWidget);
+    expect(find.text('API Docs'), findsOneWidget);
+    expect(find.text('A second source summary for the sheet.'), findsOneWidget);
+  });
+
+  testWidgets('source chip shows an icon while its favicon is loading', (
+    tester,
+  ) async {
+    const sources = <ChatSourceReference>[
+      ChatSourceReference(
+        title: 'Loading source',
+        url: 'https://favicon-loading.invalid/article',
+      ),
+    ];
+
+    await tester.pumpWidget(
+      _buildHarness(
+        Center(
+          child: OpenWebUISourcesWidget(
+            sources: sources,
+            faviconImageProvider: (_) => _PendingImageProvider(),
+          ),
+        ),
+      ),
+    );
+
+    expect(find.text('1 Source'), findsOneWidget);
+    expect(find.byIcon(Icons.language), findsOneWidget);
+  });
+
+  testWidgets(
+    'source chip resolves Gemini grounding redirects before favicon lookup',
+    (tester) async {
+      final resolvedDomain = Completer<String>();
+      final requestedFaviconUrls = <String>[];
+
+      await tester.pumpWidget(
+        _buildHarness(
+          Center(
+            child: OpenWebUISourcesWidget(
+              sources: const <ChatSourceReference>[
+                ChatSourceReference(
+                  title: 'Grounded source',
+                  url:
+                      'https://vertexaisearch.cloud.google.com/'
+                      'grounding-api-redirect/opaque',
+                ),
+              ],
+              faviconDomainResolver: (_) => resolvedDomain.future,
+              faviconImageProvider: (url) {
+                requestedFaviconUrls.add(url);
+                return _PendingImageProvider();
+              },
+            ),
+          ),
+        ),
+      );
+
+      expect(find.byIcon(Icons.language), findsOneWidget);
+      expect(requestedFaviconUrls, isEmpty);
+
+      resolvedDomain.complete('help.openai.com');
+      await tester.pump();
+
+      expect(
+        requestedFaviconUrls,
+        contains(
+          'https://www.google.com/s2/favicons'
+          '?sz=32&domain=help.openai.com',
+        ),
+      );
+    },
+  );
+
+  test('favicon domain resolver accepts only HTTPS grounding destinations', () {
+    const groundingUrl =
+        'https://vertexaisearch.cloud.google.com/'
+        'grounding-api-redirect/opaque';
+
+    expect(
+      resolveSourceFaviconDomain(
+        groundingUrl,
+        redirectResolver: (_) async =>
+            Uri.parse('https://www.help.openai.com/en/articles/'),
+      ),
+      completion('help.openai.com'),
+    );
+    expect(
+      resolveSourceFaviconDomain(
+        groundingUrl,
+        redirectResolver: (_) async =>
+            Uri.parse('http://help.openai.com/en/articles/'),
+      ),
+      completion('vertexaisearch.cloud.google.com'),
+    );
+  });
+
+  test(
+    'favicon resolver shares in-flight and completed grounding lookups',
+    () async {
+      debugResetSourceFaviconDomainCache();
+      addTearDown(debugResetSourceFaviconDomainCache);
+      const groundingUrl =
+          'https://vertexaisearch.cloud.google.com/'
+          'grounding-api-redirect/cache-test';
+      var calls = 0;
+      final gate = Completer<Uri?>();
+
+      Future<Uri?> resolver(Uri _) {
+        calls += 1;
+        return gate.future;
+      }
+
+      final first = resolveSourceFaviconDomain(
+        groundingUrl,
+        redirectResolver: resolver,
+      );
+      final second = resolveSourceFaviconDomain(
+        groundingUrl,
+        redirectResolver: resolver,
+      );
+      check(calls).equals(1);
+
+      gate.complete(Uri.parse('https://www.help.openai.com/en/articles/'));
+      check(await Future.wait([first, second]))
+          .deepEquals(['help.openai.com', 'help.openai.com']);
+      check(
+        await resolveSourceFaviconDomain(
+          groundingUrl,
+          redirectResolver: resolver,
+        ),
+      ).equals('help.openai.com');
+      check(calls).equals(1);
+    },
+  );
+
+  for (final selection in [
+    <String>['share', 'usage'],
+    <String>[],
+  ]) {
+    testWidgets(
+      'custom inline actions keep all other actions in More: $selection',
+      (tester) async {
+        final message = ChatMessage(
+          id: 'cedar-plan',
+          role: 'assistant',
+          content: 'Water the seedlings gently.',
+          timestamp: DateTime(2026, 1, 1),
+          usage: const {'total_tokens': 12},
+        );
+        await tester.pumpWidget(
+          _buildAssistantHarness(
+            message,
+            settings: AppSettings(inlineMessageActions: selection),
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(find.byIcon(Icons.content_copy_outlined), findsNothing);
+        expect(
+          find.byIcon(Icons.share_outlined),
+          selection.contains('share') ? findsOneWidget : findsNothing,
+        );
+        expect(
+          find.byIcon(Icons.info_outline),
+          selection.contains('usage') ? findsOneWidget : findsNothing,
+        );
+        await tester.tap(find.byIcon(Icons.more_horiz_rounded));
+        await tester.pumpAndSettle();
+        expect(find.text('Copy'), findsOneWidget);
+        expect(find.text('Regenerate'), findsOneWidget);
+        expect(tester.takeException(), isNull);
+      },
+    );
+  }
+
+  testWidgets('reordered inline actions follow the saved order', (
+    tester,
+  ) async {
+    final message = ChatMessage(
+      id: 'folding-plan',
+      role: 'assistant',
+      content: 'Fold the paper into three equal sections.',
+      timestamp: DateTime(2026, 1, 1),
+      usage: const {'total_tokens': 12},
+    );
+    await tester.pumpWidget(
+      _buildAssistantHarness(
+        message,
+        settings: const AppSettings(
+          inlineMessageActions: ['share', 'merge', 'usage', 'copy'],
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final share = tester.getCenter(find.byIcon(Icons.share_outlined)).dx;
+    final usage = tester.getCenter(find.byIcon(Icons.info_outline)).dx;
+    final copy = tester.getCenter(find.byIcon(Icons.content_copy_outlined)).dx;
+    expect(share, lessThan(usage));
+    expect(usage, lessThan(copy));
+    await tester.tap(find.byIcon(Icons.more_horiz_rounded));
+    await tester.pumpAndSettle();
+    expect(find.text('Regenerate'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('all chosen actions fit a narrow response footer', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(320, 640));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final message = ChatMessage(
+      id: 'cedar-plan',
+      role: 'assistant',
+      content: 'Water the seedlings gently.',
+      timestamp: DateTime(2026, 1, 1),
+      usage: const {'total_tokens': 12},
+    );
+    await tester.pumpWidget(
+      _buildAssistantHarness(
+        message,
+        settings: const AppSettings(
+          inlineMessageActions: [
+            'copy',
+            'tts',
+            'regenerate',
+            'share',
+            'usage',
+            'delete',
+          ],
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.byIcon(Icons.share_outlined), findsOneWidget);
+    expect(find.byIcon(Icons.delete_outline), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('assistant footer caps inline actions and overflows extras', (
+    tester,
+  ) async {
+    final message = ChatMessage(
+      id: 'assistant-message',
+      role: 'assistant',
+      content: 'Listen to this response.',
+      timestamp: DateTime(2024, 1, 1),
+      sources: const [
+        ChatSourceReference(
+          title: 'Source A',
+          snippet: 'Source details shown in the bottom sheet.',
+        ),
+      ],
+      usage: const {'total_tokens': 24},
+      versions: [
+        ChatMessageVersion(
+          id: 'assistant-message-v1',
+          content: 'Older version',
+          timestamp: DateTime(2023, 12, 31),
+        ),
+      ],
+    );
+
+    await tester.pumpWidget(_buildAssistantHarness(message));
+    await tester.pumpAndSettle();
+
+    expect(find.text('1 Source'), findsOneWidget);
+    expect(find.text('2/2'), findsOneWidget);
+    expect(find.byIcon(Icons.content_copy_outlined), findsOneWidget);
+    expect(find.byIcon(Icons.refresh), findsOneWidget);
+    // The version pager is inline, not in the overflow. On the latest
+    // version only "back" is available.
+    expect(
+      tester.getSemantics(find.bySemanticsLabel('Prev')),
+      matchesSemantics(
+        label: 'Prev',
+        isButton: true,
+        hasEnabledState: true,
+        isEnabled: true,
+        hasTapAction: true,
+      ),
+    );
+    expect(
+      tester.getSemantics(find.bySemanticsLabel('Next')),
+      matchesSemantics(label: 'Next', isButton: true, hasEnabledState: true),
+    );
+    expect(find.byIcon(Icons.more_horiz_rounded), findsOneWidget);
+
+    final refreshPosition = tester.getTopLeft(find.byIcon(Icons.refresh));
+    final sourcePosition = tester.getTopLeft(find.text('1 Source'));
+    final versionPosition = tester.getTopLeft(find.text('2/2'));
+    final overflowPosition = tester.getTopLeft(
+      find.byIcon(Icons.more_horiz_rounded),
+    );
+
+    // Order: version pager, icon buttons, the inline overflow, info chips.
+    expect(refreshPosition.dx, greaterThan(versionPosition.dx));
+    expect(overflowPosition.dx, greaterThan(refreshPosition.dx));
+    expect(sourcePosition.dx, greaterThan(overflowPosition.dx));
+
+    await tester.tap(find.byIcon(Icons.more_horiz_rounded));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Prev'), findsNothing);
+    expect(find.text('Next'), findsNothing);
+    expect(find.text('Info'), findsOneWidget);
+  });
+
+  testWidgets(
+    'a non-terminal grouped row keeps its info chips but no actions',
+    (tester) async {
+      // Within a grouped response only the last row paints the toolbar, but its
+      // siblings still own their own citations, so those must survive.
+      final message = ChatMessage(
+        id: 'assistant-grouped-middle',
+        role: 'assistant',
+        content: 'The first part of one grouped answer.',
+        timestamp: DateTime(2024, 1, 1),
+        isStreaming: false,
+        metadata: const {'responseDone': true},
+        sources: const [
+          ChatSourceReference(
+            title: 'Source A',
+            snippet: 'Source details shown in the bottom sheet.',
+          ),
+        ],
+      );
+
+      await tester.pumpWidget(
+        _buildAssistantHarness(
+          message,
+          isChatStreaming: false,
+          showActionBar: false,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      check(find.text('1 Source').evaluate()).length.equals(1);
+      check(find.byType(ChatActionButton).evaluate()).isEmpty();
+      check(find.byIcon(Icons.content_copy_outlined).evaluate()).isEmpty();
+      check(find.byIcon(Icons.refresh).evaluate()).isEmpty();
+      check(find.byIcon(Icons.more_horiz_rounded).evaluate()).isEmpty();
+    },
+  );
+
+  testWidgets('the bar owner reads the whole grouped response aloud', (
+    tester,
+  ) async {
+    final spoken = <String>[];
+    final message = ChatMessage(
+      id: 'assistant-grouped-last',
+      role: 'assistant',
+      content: 'The last part.',
+      timestamp: DateTime(2024, 1, 1),
+      isStreaming: false,
+      metadata: const {'responseDone': true},
+    );
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          textToSpeechControllerProvider.overrideWith(
+            () => _CapturingTextToSpeechController(spoken.add),
+          ),
+          workerManagerProvider.overrideWithValue(_ImmediateWorkerManager()),
+          isChatStreamingProvider.overrideWithValue(false),
+        ],
+        child: _buildHarness(
+          AssistantMessageWidget(
+            message: message,
+            isStreaming: false,
+            showFollowUps: false,
+            animateOnMount: false,
+            modelName: message.model,
+            resolveGroupedResponseText: () =>
+                'The first part.\n\nThe last part.',
+            onCopy: () {},
+            onRegenerate: () {},
+            onDelete: () {},
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byIcon(Icons.volume_up_outlined));
+    await tester.pumpAndSettle();
+
+    check(spoken).length.equals(1);
+    check(spoken.single).contains('The first part.');
+    check(spoken.single).contains('The last part.');
+  });
+
+  testWidgets('assistant overflow uses the native iOS 26 popup menu', (
+    tester,
+  ) async {
+    PlatformUiCapabilities.debugPlatformOverride = TargetPlatform.iOS;
+    PlatformUiCapabilities.debugIOSMajorVersionOverride = 26;
+    PlatformUiCapabilities.debugNativeIOS26Override = true;
+
+    final message = ChatMessage(
+      id: 'assistant-native-overflow',
+      role: 'assistant',
+      content: 'Response with overflow actions.',
+      timestamp: DateTime(2024, 1, 1),
+      usage: const {'total_tokens': 24},
+      versions: [
+        ChatMessageVersion(
+          id: 'assistant-native-overflow-v1',
+          content: 'Older version',
+          timestamp: DateTime(2023, 12, 31),
+        ),
+      ],
+    );
+
+    await tester.pumpWidget(_buildAssistantHarness(message));
+    await tester.pump();
+
+    final nativeMenu = tester.widget<CNPopupMenuButton>(
+      find.byType(CNPopupMenuButton),
+    );
+    expect(nativeMenu.buttonStyle, CNButtonStyle.plain);
+    expect(nativeMenu.width, 32);
+    expect(
+      nativeMenu.items.whereType<CNPopupMenuItem>().last.isDestructive,
+      isTrue,
+    );
+
+    // The native package delays platform-view readiness in debug builds.
+    // Dispose the control before advancing that guard timer in widget tests.
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(milliseconds: 500));
+  });
+
+  testWidgets('a voice reply names itself in the app language', (
+    tester,
+  ) async {
+    final message = ChatMessage(
+      id: 'voice-reply',
+      role: 'assistant',
+      content: 'Hi there.',
+      timestamp: DateTime(2026),
+      model: 'gpt-realtime',
+      metadata: const {
+        kMessageVoiceMetadataKey: {
+          'model': 'gpt-realtime',
+          'speech': [
+            {'item_id': 'item-1', 'transcript': 'Hi there.'},
+          ],
+        },
+      },
+    );
+
+    await tester.pumpWidget(
+      _buildAssistantHarness(message, locale: const Locale('en')),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('gpt-realtime · spoken'), findsOneWidget);
+
+    await tester.pumpWidget(
+      _buildAssistantHarness(message, locale: const Locale('de')),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('gpt-realtime · gesprochen'), findsOneWidget);
+    expect(find.text('gpt-realtime · spoken'), findsNothing);
+  });
+
+  testWidgets('assistant header follows the active version model', (
+    tester,
+  ) async {
+    final message = ChatMessage(
+      id: 'assistant-message',
+      role: 'assistant',
+      content: 'Current version',
+      timestamp: DateTime(2024, 1, 1),
+      model: 'Model B',
+      versions: [
+        ChatMessageVersion(
+          id: 'assistant-message-v1',
+          content: 'Older version',
+          timestamp: DateTime(2023, 12, 31),
+          model: 'Model A',
+        ),
+      ],
+    );
+
+    await tester.pumpWidget(_buildAssistantHarness(message));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Model B'), findsOneWidget);
+
+    await _tapVersionControl(
+      tester,
+      visibleIcon: Icons.chevron_left,
+      overflowLabel: 'Prev',
+    );
+
+    expect(find.text('Model A'), findsOneWidget);
+    expect(find.text('Model B'), findsNothing);
+
+    await _tapVersionControl(
+      tester,
+      visibleIcon: Icons.chevron_right,
+      overflowLabel: 'Next',
+    );
+
+    expect(find.text('Model B'), findsOneWidget);
+    expect(find.text('Model A'), findsNothing);
+  });
+
+  testWidgets('archived version stays settled when the live version resumes', (
+    tester,
+  ) async {
+    final message = ChatMessage(
+      id: 'assistant-version-resume',
+      role: 'assistant',
+      content: 'Current version',
+      timestamp: DateTime(2024, 1, 1),
+      versions: [
+        ChatMessageVersion(
+          id: 'assistant-version-resume-v1',
+          content: 'Older version',
+          timestamp: DateTime(2023, 12, 31),
+        ),
+      ],
+    );
+
+    await tester.pumpWidget(_buildAssistantHarness(message));
+    await tester.pumpAndSettle();
+    await _tapVersionControl(
+      tester,
+      visibleIcon: Icons.chevron_left,
+      overflowLabel: 'Prev',
+    );
+
+    await tester.pumpWidget(
+      _buildAssistantHarness(
+        message.copyWith(isStreaming: true),
+        isStreaming: true,
+      ),
+    );
+    await tester.pump();
+
+    expect(find.text('Older version'), findsOneWidget);
+    expect(find.byIcon(Icons.content_copy_outlined), findsOneWidget);
+    expect(
+      tester
+          .widget<StreamingMarkdownWidget>(find.byType(StreamingMarkdownWidget))
+          .isStreaming,
+      isFalse,
+    );
+  });
+
+  testWidgets('pending-only finished statuses keep the last row visible', (
+    tester,
+  ) async {
+    // Hiding the whole row at settle shifted the bottom-anchored layout by
+    // the row height and lost the only description of what the turn did;
+    // the last update stays visible (without the pending spinner) instead.
+    final pendingOnly = ChatMessage(
+      id: 'assistant-pending',
+      role: 'assistant',
+      content: 'Visible response body',
+      timestamp: DateTime(2024, 1, 1),
+      statusHistory: const [
+        ChatStatusUpdate(description: 'Searching...', done: false),
+      ],
+    );
+
+    await tester.pumpWidget(_buildAssistantHarness(pendingOnly));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(StreamingStatusWidget), findsOneWidget);
+    expect(find.text('Searching...'), findsOneWidget);
+  });
+
+  testWidgets('finished nullable-done statuses remain visible', (tester) async {
+    final message = ChatMessage(
+      id: 'assistant-nullable-status',
+      role: 'assistant',
+      content: 'Visible response body',
+      timestamp: DateTime(2024, 1, 1),
+      statusHistory: const [
+        ChatStatusUpdate(description: 'Generating image...'),
+      ],
+    );
+
+    await tester.pumpWidget(_buildAssistantHarness(message));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Generating image...'), findsOneWidget);
+    expect(find.byType(StreamingStatusWidget), findsOneWidget);
+  });
+
+  testWidgets('follow-ups update in place without size transitions', (
+    tester,
+  ) async {
+    final baseline = ChatMessage(
+      id: 'assistant-follow-ups',
+      role: 'assistant',
+      content: 'Visible response body',
+      timestamp: DateTime(2024, 1, 1),
+    );
+
+    await tester.pumpWidget(
+      _buildAssistantHarness(baseline, showFollowUps: true),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.byType(FollowUpSuggestionBar), findsNothing);
+
+    await tester.pumpWidget(
+      _buildAssistantHarness(
+        baseline.copyWith(followUps: const ['Ask again']),
+        showFollowUps: true,
+      ),
+    );
+    await tester.pump();
+
+    expect(find.byType(SizeTransition), findsNothing);
+    expect(find.byType(FollowUpSuggestionBar), findsOneWidget);
+    expect(find.text('Ask again'), findsOneWidget);
+
+    await tester.pumpWidget(
+      _buildAssistantHarness(
+        baseline.copyWith(followUps: const ['Try another angle']),
+        showFollowUps: true,
+      ),
+    );
+    await tester.pump();
+
+    expect(find.byType(SizeTransition), findsNothing);
+    expect(find.byType(FollowUpSuggestionBar), findsOneWidget);
+    expect(find.text('Ask again'), findsNothing);
+    expect(find.text('Try another angle'), findsOneWidget);
+  });
+
+  testWidgets('follow-up selection delegates to the page send path', (
+    tester,
+  ) async {
+    final selected = <String>[];
+    final message = ChatMessage(
+      id: 'assistant-follow-up-selection',
+      role: 'assistant',
+      content: 'Visible response body',
+      timestamp: DateTime(2024, 1, 1),
+      followUps: const ['  Ask again  '],
+    );
+
+    await tester.pumpWidget(
+      _buildAssistantHarness(
+        message,
+        showFollowUps: true,
+        onFollowUpSelected: selected.add,
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Ask again'));
+    await tester.pump();
+
+    expect(selected, const ['Ask again']);
+  });
+
+  testWidgets('follow-ups stay visible through transient empty snapshots', (
+    tester,
+  ) async {
+    final baseline = ChatMessage(
+      id: 'assistant-follow-ups',
+      role: 'assistant',
+      content: 'Visible response body',
+      timestamp: DateTime(2024, 1, 1),
+    );
+
+    await tester.pumpWidget(
+      _buildAssistantHarness(
+        baseline.copyWith(followUps: const ['Ask again']),
+        showFollowUps: true,
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.byType(FollowUpSuggestionBar), findsOneWidget);
+    expect(find.text('Ask again'), findsOneWidget);
+
+    await tester.pumpWidget(
+      _buildAssistantHarness(baseline, showFollowUps: true),
+    );
+    await tester.pump();
+
+    expect(find.byType(FollowUpSuggestionBar), findsOneWidget);
+    expect(find.text('Ask again'), findsOneWidget);
+    expect(find.byType(SizeTransition), findsNothing);
+
+    await tester.pumpWidget(
+      _buildAssistantHarness(
+        baseline.copyWith(followUps: const ['Try another angle']),
+        showFollowUps: true,
+      ),
+    );
+    await tester.pump();
+
+    expect(find.byType(FollowUpSuggestionBar), findsOneWidget);
+    expect(find.text('Ask again'), findsNothing);
+    expect(find.text('Try another angle'), findsOneWidget);
+  });
+
+  testWidgets('completed response-done metadata shows enabled footer actions', (
+    tester,
+  ) async {
+    var copyTapCount = 0;
+    var regenerateTapCount = 0;
+    final message = ChatMessage(
+      id: 'assistant-response-done',
+      role: 'assistant',
+      content: 'Visible response body',
+      timestamp: DateTime(2024, 1, 1),
+      isStreaming: false,
+      metadata: const {'responseDone': true},
+      followUps: const ['Ask again'],
+    );
+
+    await tester.pumpWidget(
+      _buildAssistantHarness(
+        message,
+        isStreaming: false,
+        isChatStreaming: false,
+        showFollowUps: true,
+        onCopy: () => copyTapCount += 1,
+        onRegenerate: () => regenerateTapCount += 1,
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const ValueKey('actions')), findsOneWidget);
+    expect(find.byIcon(Icons.content_copy_outlined), findsOneWidget);
+    expect(find.byIcon(Icons.refresh), findsOneWidget);
+    expect(find.byType(FollowUpSuggestionBar), findsOneWidget);
+    expect(find.text('Ask again'), findsOneWidget);
+    expect(
+      tester
+          .widget<FollowUpSuggestionBar>(find.byType(FollowUpSuggestionBar))
+          .isBusy,
+      isFalse,
+    );
+
+    await tester.tap(find.byIcon(Icons.content_copy_outlined));
+    await tester.pump();
+    await tester.tap(find.byIcon(Icons.refresh));
+    await tester.pump();
+
+    expect(copyTapCount, 1);
+    expect(regenerateTapCount, 1);
+  });
+
+  testWidgets(
+    'response-done metadata shows actions before the stream flag clears',
+    (tester) async {
+      final message = ChatMessage(
+        id: 'assistant-response-done-streaming',
+        role: 'assistant',
+        content: 'Visible response body',
+        timestamp: DateTime(2024, 1, 1),
+        isStreaming: true,
+        metadata: const {'responseDone': true},
+        followUps: const ['Ask again'],
+      );
+
+      await tester.pumpWidget(
+        _buildAssistantHarness(
+          message,
+          isStreaming: true,
+          isChatStreaming: true,
+          showFollowUps: true,
+          onCopy: () {},
+          onRegenerate: () {},
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // `responseDone` is a settled UI state: the action row and follow-ups
+      // appear even though the transport `isStreaming` flag has not flipped yet.
+      expect(find.byKey(const ValueKey('actions')), findsOneWidget);
+      expect(find.byType(FollowUpSuggestionBar), findsOneWidget);
+    },
+  );
+
+  for (final recoverable in [false, true]) {
+    testWidgets(
+      'error footer follows recoverability $recoverable until completion',
+      (tester) async {
+        final message = ChatMessage(
+          id: 'assistant-errored-streaming',
+          role: 'assistant',
+          content: 'Partial answer',
+          timestamp: DateTime(2024, 1, 1),
+          isStreaming: true,
+          error: const ChatMessageError(content: 'boom'),
+          metadata: {'openwebuiRecoverableError': recoverable},
+        );
+
+        await tester.pumpWidget(
+          _buildAssistantHarness(
+            message,
+            isStreaming: true,
+            isChatStreaming: true,
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(
+          find.byKey(const ValueKey('actions')),
+          recoverable ? findsNothing : findsOneWidget,
+        );
+        expect(find.text('boom'), findsOneWidget);
+        await tester.pumpWidget(
+          _buildAssistantHarness(
+            message.copyWith(isStreaming: false),
+            isChatStreaming: false,
+          ),
+        );
+        await tester.pumpAndSettle();
+        expect(find.byKey(const ValueKey('actions')), findsOneWidget);
+      },
+    );
+  }
+
+  testWidgets('a turn that fails mid-stream reveals the action footer', (
+    tester,
+  ) async {
+    final streaming = ChatMessage(
+      id: 'assistant-fail-midstream',
+      role: 'assistant',
+      content: 'Partial',
+      timestamp: DateTime(2024, 1, 1),
+      isStreaming: true,
+    );
+
+    await tester.pumpWidget(
+      _buildAssistantHarness(
+        streaming,
+        isStreaming: true,
+        isChatStreaming: true,
+      ),
+    );
+    await tester.pump();
+    expect(find.byKey(const ValueKey('actions')), findsNothing);
+
+    // An error appears while the transport flag is still streaming: the phase
+    // flips to failed without an isStreaming/responseDone change, so the settle
+    // refresh must still surface the action row.
+    final failed = streaming.copyWith(
+      error: const ChatMessageError(content: 'boom'),
+    );
+    await tester.pumpWidget(
+      _buildAssistantHarness(failed, isStreaming: true, isChatStreaming: true),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const ValueKey('actions')), findsOneWidget);
+    expect(find.text('boom'), findsOneWidget);
+  });
+
+  testWidgets('starting a new stream clears stale footer actions immediately', (
+    tester,
+  ) async {
+    final completed = ChatMessage(
+      id: 'assistant-reused-for-streaming',
+      role: 'assistant',
+      content: 'Finished answer',
+      timestamp: DateTime(2024, 1, 1),
+    );
+
+    await tester.pumpWidget(_buildAssistantHarness(completed));
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const ValueKey('actions')), findsOneWidget);
+
+    final streaming = completed.copyWith(content: '', isStreaming: true);
+    await tester.pumpWidget(
+      _buildAssistantHarness(streaming, isStreaming: true),
+    );
+    await tester.pump();
+
+    expect(find.byKey(const ValueKey('actions')), findsNothing);
+
+    await tester.pump(const Duration(milliseconds: 150));
+
+    expect(find.byKey(const ValueKey('actions')), findsNothing);
+  });
+
+  testWidgets('streaming assistant skips hidden action provider work', (
+    tester,
+  ) async {
+    var ttsBuilds = 0;
+    final message = ChatMessage(
+      id: 'assistant-streaming-footer',
+      role: 'assistant',
+      content: '',
+      timestamp: DateTime(2024, 1, 1),
+      isStreaming: true,
+    );
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          textToSpeechControllerProvider.overrideWith(
+            () => _CountingTextToSpeechController(() => ttsBuilds += 1),
+          ),
+          isChatStreamingProvider.overrideWithValue(false),
+        ],
+        child: _buildHarness(
+          AssistantMessageWidget(
+            message: message,
+            isStreaming: true,
+            animateOnMount: false,
+            modelName: message.model,
+            onCopy: () {},
+            onRegenerate: () {},
+            onDelete: () {},
+          ),
+        ),
+      ),
+    );
+
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 150));
+
+    expect(ttsBuilds, 0);
+  });
+
+  testWidgets('streaming assistant suppresses actions until completion', (
+    tester,
+  ) async {
+    final streaming = ChatMessage(
+      id: 'assistant-streaming-footer-fade',
+      role: 'assistant',
+      content: '',
+      timestamp: DateTime(2024, 1, 1),
+      isStreaming: true,
+    );
+
+    await tester.pumpWidget(
+      _buildAssistantHarness(streaming, isStreaming: true),
+    );
+    await tester.pump();
+
+    await tester.pump(const Duration(milliseconds: 150));
+
+    expect(find.byKey(const ValueKey('actions')), findsNothing);
+
+    final done = streaming.copyWith(
+      content: 'Done',
+      isStreaming: false,
+      metadata: const {'responseDone': true},
+    );
+    await tester.pumpWidget(_buildAssistantHarness(done, isStreaming: false));
+    await tester.pump();
+
+    final actionsFinder = find.byKey(const ValueKey('actions'));
+    expect(actionsFinder, findsOneWidget);
+    expect(_hasInProgressFadeAncestor(tester, actionsFinder), isFalse);
+  });
+
+  testWidgets('streaming body fades in once when first content arrives', (
+    tester,
+  ) async {
+    ChatMessage streamingMessage(String content) => ChatMessage(
+      id: 'assistant-streaming-fade',
+      role: 'assistant',
+      content: content,
+      timestamp: DateTime(2024, 1, 1),
+      isStreaming: true,
+    );
+
+    await tester.pumpWidget(
+      _buildAssistantHarness(streamingMessage(''), isStreaming: true),
+    );
+    await tester.pump();
+
+    // The fade wrapper is always present (its type stays stable to avoid
+    // tearing down the markdown subtree at streaming boundaries), but it is
+    // fully opaque while there is no content to fade in.
+    final initialFadeFinder = find.byKey(
+      const ValueKey('assistant-streaming-content-fade'),
+    );
+    expect(initialFadeFinder, findsOneWidget);
+    expect(tester.widget<FadeTransition>(initialFadeFinder).opacity.value, 1);
+
+    await tester.pumpWidget(
+      _buildAssistantHarness(streamingMessage('Hello'), isStreaming: true),
+    );
+    await tester.pump();
+    await tester.pump();
+
+    final fadeFinder = find.byKey(
+      const ValueKey('assistant-streaming-content-fade'),
+    );
+    expect(fadeFinder, findsOneWidget);
+    expect(
+      tester.widget<FadeTransition>(fadeFinder).opacity.value,
+      lessThan(1),
+    );
+
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(tester.widget<FadeTransition>(fadeFinder).opacity.value, 1);
+
+    await tester.pumpWidget(
+      _buildAssistantHarness(
+        streamingMessage('Hello again'),
+        isStreaming: true,
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+
+    expect(tester.widget<FadeTransition>(fadeFinder).opacity.value, 1);
+  });
+
+  testWidgets('streaming body fades when first content is present on mount', (
+    tester,
+  ) async {
+    final message = ChatMessage(
+      id: 'assistant-streaming-initial-fade',
+      role: 'assistant',
+      content: 'Already streaming',
+      timestamp: DateTime(2024, 1, 1),
+      isStreaming: true,
+    );
+
+    await tester.pumpWidget(_buildAssistantHarness(message, isStreaming: true));
+    await tester.pump();
+
+    final fadeFinder = find.byKey(
+      const ValueKey('assistant-streaming-content-fade'),
+    );
+    expect(fadeFinder, findsOneWidget);
+    expect(
+      tester.widget<FadeTransition>(fadeFinder).opacity.value,
+      lessThan(1),
+    );
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(tester.widget<FadeTransition>(fadeFinder).opacity.value, 1);
+  });
+
+  testWidgets(
+    'completed response-done metadata renders long plain content with final body mode',
+    (tester) async {
+      final message = ChatMessage(
+        id: 'assistant-response-done-body',
+        role: 'assistant',
+        content: List<String>.generate(13, (index) => 'Line $index').join('\n'),
+        timestamp: DateTime(2024, 1, 1),
+        isStreaming: false,
+        metadata: const {'responseDone': true},
+      );
+
+      await tester.pumpWidget(
+        _buildAssistantHarness(message, isStreaming: false),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.byType(SelectionArea), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'completed response-done metadata passes final body mode to custom builders',
+    (tester) async {
+      final message = ChatMessage(
+        id: 'assistant-response-done-builder',
+        role: 'assistant',
+        content: 'Visible response body',
+        timestamp: DateTime(2024, 1, 1),
+        isStreaming: false,
+        metadata: const {'responseDone': true},
+      );
+
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            textToSpeechControllerProvider.overrideWith(
+              _TestTextToSpeechController.new,
+            ),
+            assistantResponseBuilderProvider.overrideWith(
+              (ref) => (context, response) {
+                return Text('builder-streaming:${response.isStreaming}');
+              },
+            ),
+          ],
+          child: MaterialApp(
+            theme: AppTheme.light(TweakcnThemes.t3Chat),
+            localizationsDelegates: conduitLocalizationsDelegates,
+            supportedLocales: AppLocalizations.supportedLocales,
+            home: Scaffold(
+              body: AssistantMessageWidget(
+                message: message,
+                isStreaming: false,
+                showFollowUps: false,
+                animateOnMount: false,
+                modelName: message.model,
+                onCopy: () {},
+                onRegenerate: () {},
+                onDelete: () {},
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('builder-streaming:false'), findsOneWidget);
+    },
+  );
+
+  testWidgets('completed response-done metadata enables tts', (tester) async {
+    final message = ChatMessage(
+      id: 'assistant-response-done-tts',
+      role: 'assistant',
+      content: 'Visible response body',
+      timestamp: DateTime(2024, 1, 1),
+      isStreaming: false,
+      metadata: const {'responseDone': true},
+    );
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          textToSpeechControllerProvider.overrideWith(
+            () => _RecordingTextToSpeechController(() {}),
+          ),
+        ],
+        child: MaterialApp(
+          theme: AppTheme.light(TweakcnThemes.t3Chat),
+          localizationsDelegates: conduitLocalizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: Scaffold(
+            body: AssistantMessageWidget(
+              message: message,
+              isStreaming: false,
+              showFollowUps: false,
+              animateOnMount: false,
+              modelName: message.model,
+              onCopy: () {},
+              onRegenerate: () {},
+              onDelete: () {},
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.byIcon(Icons.volume_up_outlined), findsOneWidget);
+    final ttsButton = tester.widget<ChatActionButton>(
+      find.ancestor(
+        of: find.byIcon(Icons.volume_up_outlined),
+        matching: find.byType(ChatActionButton),
+      ),
+    );
+    expect(ttsButton.onTap, isNotNull);
+  });
+
+  testWidgets(
+    'completed response-done metadata re-enables attachment animations',
+    (tester) async {
+      final message = ChatMessage(
+        id: 'assistant-response-done-attachment',
+        role: 'assistant',
+        content: '',
+        timestamp: DateTime(2024, 1, 1),
+        isStreaming: false,
+        metadata: const {'responseDone': true},
+        attachmentIds: const ['attachment-1'],
+      );
+
+      await tester.pumpWidget(
+        _buildAssistantHarness(message, isStreaming: false),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.byType(EnhancedAttachment), findsOneWidget);
+      expect(
+        tester
+            .widget<EnhancedAttachment>(find.byType(EnhancedAttachment))
+            .disableAnimation,
+        isFalse,
+      );
+    },
+  );
+
+  testWidgets('existing attachment elements survive additions to the grid', (
+    tester,
+  ) async {
+    final message = ChatMessage(
+      id: 'assistant-growing-attachments',
+      role: 'assistant',
+      content: '',
+      timestamp: DateTime(2024, 1, 1),
+      isStreaming: false,
+      metadata: const {'responseDone': true},
+      attachmentIds: const ['attachment-1', 'attachment-2'],
+    );
+
+    await tester.pumpWidget(_buildAssistantHarness(message));
+    await tester.pump();
+    final firstAttachment = tester.element(
+      find.byKey(const ValueKey('attachment_attachment-1')),
+    );
+
+    await tester.pumpWidget(
+      _buildAssistantHarness(
+        message.copyWith(
+          attachmentIds: const ['attachment-1', 'attachment-2', 'attachment-3'],
+        ),
+      ),
+    );
+    await tester.pump();
+
+    expect(
+      identical(
+        tester.element(find.byKey(const ValueKey('attachment_attachment-1'))),
+        firstAttachment,
+      ),
+      isTrue,
+    );
+  });
+
+  testWidgets('reduced motion preserves generated image reveal', (
+    tester,
+  ) async {
+    final message = ChatMessage(
+      id: 'assistant-reduced-motion-generated-image',
+      role: 'assistant',
+      content: '',
+      timestamp: DateTime(2024, 1, 1),
+      isStreaming: false,
+      metadata: const {'responseDone': true},
+      files: const [
+        {'type': 'image', 'url': 'https://example.com/generated.png'},
+      ],
+    );
+
+    await tester.pumpWidget(
+      _buildAssistantHarness(message, disableAnimations: true),
+    );
+    await tester.pump();
+
+    expect(find.byType(EnhancedImageAttachment), findsOneWidget);
+    expect(
+      tester
+          .widget<EnhancedImageAttachment>(find.byType(EnhancedImageAttachment))
+          .disableAnimation,
+      isFalse,
+    );
+  });
+
+  testWidgets('queued offline placeholder shows retry and cancel actions', (
+    tester,
+  ) async {
+    final message = ChatMessage(
+      id: 'queued-assistant',
+      role: 'assistant',
+      content: '',
+      timestamp: DateTime(2024, 1, 1),
+      isStreaming: true,
+    );
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          textToSpeechControllerProvider.overrideWith(
+            _TestTextToSpeechController.new,
+          ),
+          queuedCompletionInfoForMessageProvider('queued-assistant')
+              .overrideWith(
+                (ref) => Stream<QueuedCompletionInfo?>.value(
+                  const QueuedCompletionInfo(
+                    databaseOwner: Object(),
+                    seq: 42,
+                    chatId: 'chat-1',
+                    scopedChatId: 'chat-1',
+                    assistantMessageId: 'queued-assistant',
+                    phase: QueuedCompletionPhase.pending,
+                    isOffline: true,
+                    lastError: 'offline',
+                    nextAttemptAt: 123,
+                  ),
+                ),
+              ),
+        ],
+        child: MaterialApp(
+          theme: AppTheme.light(TweakcnThemes.t3Chat),
+          localizationsDelegates: conduitLocalizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: Scaffold(
+            body: AssistantMessageWidget(
+              message: message,
+              isStreaming: true,
+              showFollowUps: false,
+              animateOnMount: false,
+              modelName: message.model,
+              onCopy: () {},
+              onRegenerate: () {},
+              onDelete: () {},
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    expect(find.text('Queued offline'), findsOneWidget);
+    expect(
+      find.text('This response will start when the server is reachable.'),
+      findsOneWidget,
+    );
+    expect(find.text('Retry'), findsOneWidget);
+    expect(find.text('Cancel'), findsOneWidget);
+    expect(find.byIcon(Icons.content_copy_outlined), findsNothing);
+  });
+
+  testWidgets('failed queued completion keeps partial content and recovery', (
+    tester,
+  ) async {
+    final message = ChatMessage(
+      id: 'partial-assistant',
+      role: 'assistant',
+      content: 'Partial answer',
+      timestamp: DateTime(2024, 1, 1),
+      isStreaming: true,
+    );
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          textToSpeechControllerProvider.overrideWith(
+            _TestTextToSpeechController.new,
+          ),
+          queuedCompletionInfoForMessageProvider('partial-assistant')
+              .overrideWith(
+                (ref) => Stream<QueuedCompletionInfo?>.value(
+                  const QueuedCompletionInfo(
+                    databaseOwner: Object(),
+                    seq: 43,
+                    chatId: 'chat-1',
+                    scopedChatId: 'chat-1',
+                    assistantMessageId: 'partial-assistant',
+                    phase: QueuedCompletionPhase.failed,
+                    isOffline: false,
+                    lastError: 'boom',
+                  ),
+                ),
+              ),
+        ],
+        child: MaterialApp(
+          theme: AppTheme.light(TweakcnThemes.t3Chat),
+          localizationsDelegates: conduitLocalizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: Scaffold(
+            body: AssistantMessageWidget(
+              message: message,
+              isStreaming: true,
+              showFollowUps: false,
+              animateOnMount: false,
+              modelName: message.model,
+              onCopy: () {},
+              onRegenerate: () {},
+              onDelete: () {},
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    expect(find.text('Partial answer'), findsOneWidget);
+    expect(find.text('Send failed'), findsOneWidget);
+    expect(find.text('Retry'), findsOneWidget);
+    expect(find.text('Cancel'), findsOneWidget);
+    expect(find.byIcon(Icons.content_copy_outlined), findsNothing);
+  });
+
+  testWidgets('pending queued completion keeps partial content and recovery', (
+    tester,
+  ) async {
+    final message = ChatMessage(
+      id: 'pending-partial-assistant',
+      role: 'assistant',
+      content: 'Partial pending answer',
+      timestamp: DateTime(2024, 1, 1),
+      isStreaming: true,
+    );
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          textToSpeechControllerProvider.overrideWith(
+            _TestTextToSpeechController.new,
+          ),
+          queuedCompletionInfoForMessageProvider('pending-partial-assistant')
+              .overrideWith(
+                (ref) => Stream<QueuedCompletionInfo?>.value(
+                  const QueuedCompletionInfo(
+                    databaseOwner: Object(),
+                    seq: 44,
+                    chatId: 'chat-1',
+                    scopedChatId: 'chat-1',
+                    assistantMessageId: 'pending-partial-assistant',
+                    phase: QueuedCompletionPhase.pending,
+                    isOffline: true,
+                    lastError: 'offline',
+                  ),
+                ),
+              ),
+        ],
+        child: MaterialApp(
+          theme: AppTheme.light(TweakcnThemes.t3Chat),
+          localizationsDelegates: conduitLocalizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: Scaffold(
+            body: AssistantMessageWidget(
+              message: message,
+              isStreaming: true,
+              showFollowUps: false,
+              animateOnMount: false,
+              modelName: message.model,
+              onCopy: () {},
+              onRegenerate: () {},
+              onDelete: () {},
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    expect(find.text('Partial pending answer'), findsOneWidget);
+    expect(find.text('Queued offline'), findsOneWidget);
+    expect(find.text('Retry'), findsOneWidget);
+    expect(find.text('Cancel'), findsOneWidget);
+    expect(find.byIcon(Icons.content_copy_outlined), findsNothing);
+  });
+
+  Future<void> pumpFailedQueued(
+    WidgetTester tester, {
+    required String lastError,
+    String? frozenReasoningEffort,
+    String? frozenPickedReasoningEffort,
+    Iterable<Override> modelOverrides = const <Override>[],
+  }) async {
+    final message = ChatMessage(
+      id: 'frozen-assistant',
+      role: 'assistant',
+      content: '',
+      timestamp: DateTime(2024, 1, 1),
+      isStreaming: true,
+    );
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          textToSpeechControllerProvider.overrideWith(
+            _TestTextToSpeechController.new,
+          ),
+          ...modelOverrides,
+          queuedCompletionInfoForMessageProvider('frozen-assistant')
+              .overrideWith(
+                (ref) => Stream<QueuedCompletionInfo?>.value(
+                  QueuedCompletionInfo(
+                    databaseOwner: Object(),
+                    seq: 45,
+                    chatId: 'chat-1',
+                    scopedChatId: 'chat-1',
+                    assistantMessageId: 'frozen-assistant',
+                    phase: QueuedCompletionPhase.failed,
+                    isOffline: false,
+                    lastError: lastError,
+                    frozenReasoningEffort: frozenReasoningEffort,
+                    frozenPickedReasoningEffort: frozenPickedReasoningEffort,
+                  ),
+                ),
+              ),
+        ],
+        child: MaterialApp(
+          theme: AppTheme.light(TweakcnThemes.t3Chat),
+          localizationsDelegates: conduitLocalizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          home: Scaffold(
+            body: AssistantMessageWidget(
+              message: message,
+              isStreaming: true,
+              showFollowUps: false,
+              animateOnMount: false,
+              modelName: message.model,
+              onCopy: () {},
+              onRegenerate: () {},
+              onDelete: () {},
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+  }
+
+  testWidgets('frozen snapshot effort offers recovery without current '
+      'opt-ins (issue #779)', (tester) async {
+    await pumpFailedQueued(
+      tester,
+      lastError: 'Upstream rejected reasoning_effort',
+      frozenReasoningEffort: 'high',
+    );
+    expect(find.text('Retry without reasoning effort'), findsOneWidget);
+  });
+
+  testWidgets('an error merely naming the parameter does not offer recovery',
+      (tester) async {
+    await pumpFailedQueued(
+      tester,
+      lastError: 'Upstream rejected reasoning_effort',
+    );
+    expect(find.text('Retry without reasoning effort'), findsNothing);
+  });
+
+  testWidgets('an explicitly refusing model hides queued recovery even with '
+      'a frozen value (issue #779)', (tester) async {
+    await pumpFailedQueued(
+      tester,
+      lastError: 'Upstream rejected reasoning_effort',
+      frozenReasoningEffort: 'high',
+      modelOverrides: [
+        selectedModelProvider.overrideWith(_RefusingSelectedModel.new),
+      ],
+    );
+    expect(find.text('Retry without reasoning effort'), findsNothing);
+  });
+
+  testWidgets('a non-refusing selected model still offers recovery from the '
+      'frozen value', (tester) async {
+    await pumpFailedQueued(
+      tester,
+      lastError: 'Upstream rejected reasoning_effort',
+      frozenReasoningEffort: 'high',
+      modelOverrides: [
+        selectedModelProvider.overrideWith(_AdvertisingSelectedModel.new),
+      ],
+    );
+    expect(find.text('Retry without reasoning effort'), findsOneWidget);
+  });
+
+  // A model that does not advertise reasoning effort was sent only the
+  // picker's frozen value, never the chat's (issue #611).
+  for (final (picked, offered) in [(null, false), ('high', true)]) {
+    testWidgets('queued recovery for an undeclared model follows its frozen '
+        'pick ($picked)', (tester) async {
+      await pumpFailedQueued(
+        tester,
+        lastError: 'Upstream rejected reasoning_effort',
+        frozenReasoningEffort: 'high',
+        frozenPickedReasoningEffort: picked,
+        modelOverrides: [
+          // Signed out: the model holds no pick of its own.
+          apiServiceProvider.overrideWithValue(null),
+          selectedModelProvider.overrideWith(
+            () => _SelectedAs(
+              const Model(id: 'plain-chat-model', name: 'Plain'),
+            ),
+          ),
+        ],
+      );
+      expect(
+        find.text('Retry without reasoning effort'),
+        offered ? findsOneWidget : findsNothing,
+      );
+    });
+  }
+
+  group('retry without reasoning effort on a live answer', () {
+    const plain = Model(id: 'plain-chat-model', name: 'Plain');
+    final failed = ChatMessage(
+      id: 'live-assistant',
+      role: 'assistant',
+      content: '',
+      timestamp: DateTime(2024, 1, 1),
+      error: const ChatMessageError(
+        content: 'Unrecognized request argument supplied: reasoning_effort',
+      ),
+    );
+    final retryWithoutEffort = find.byIcon(Icons.highlight_off);
+
+    /// [picks] are the picker's own picks by model id, on the `live` server.
+    Future<ProviderContainer> pumpFailed(
+      WidgetTester tester, {
+      required Model selected,
+      Map<String, String> picks = const {},
+      Map<String, dynamic>? chatParams,
+      bool pickWritesFail = false,
+      VoidCallback? onRegenerate,
+    }) async {
+      final container = ProviderContainer(
+        overrides: [
+          textToSpeechControllerProvider.overrideWith(
+            _TestTextToSpeechController.new,
+          ),
+          streamingHapticsEnabledProvider.overrideWithValue(false),
+          isChatStreamingProvider.overrideWithValue(false),
+          apiServiceProvider.overrideWithValue(
+            ApiService(
+              serverConfig: const ServerConfig(
+                id: 'live',
+                name: 'Live',
+                url: 'https://live.example.test',
+              ),
+              workerManager: WorkerManager(),
+            ),
+          ),
+          openWebUiChatSettingsAccessProvider.overrideWith(
+            (ref) async => OpenWebUiChatSettingsAccess.all,
+          ),
+          selectedModelProvider.overrideWith(() => _SelectedAs(selected)),
+          // A live answer, not a queued one.
+          queuedCompletionInfoForMessageProvider(
+            failed.id,
+          ).overrideWith((ref) => Stream<QueuedCompletionInfo?>.value(null)),
+          localReasoningEffortsProvider.overrideWith(
+            () => _PickedEfforts({
+              for (final MapEntry(:key, :value) in picks.entries)
+                'openwebui:live:$key': value,
+            }, writesFail: pickWritesFail),
+          ),
+          // Branching is not under test.
+          chatForkAvailabilityProvider.overrideWithValue(
+            ChatForkAvailability.hidden,
+          ),
+          if (chatParams != null)
+            activeConversationProvider.overrideWith(
+              () => _ActiveAs(
+                Conversation(
+                  id: 'chat-1',
+                  title: 'Chat',
+                  createdAt: DateTime(2024, 1, 1),
+                  updatedAt: DateTime(2024, 1, 1),
+                  chatParams: chatParams,
+                ),
+              ),
+            ),
+        ],
+      );
+      addTearDown(container.dispose);
+      await tester.pumpWidget(
+        UncontrolledProviderScope(
+          container: container,
+          child: _buildHarness(
+            AssistantMessageWidget(
+              message: failed,
+              isStreaming: false,
+              showFollowUps: false,
+              animateOnMount: false,
+              modelName: failed.model,
+              onCopy: () {},
+              onRegenerate: onRegenerate ?? () {},
+              onDelete: () {},
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      return container;
+    }
+
+    testWidgets('is offered when the model was sent its own pick', (
+      tester,
+    ) async {
+      await pumpFailed(tester, selected: plain, picks: {plain.id: 'high'});
+      expect(retryWithoutEffort, findsOneWidget);
+    });
+
+    testWidgets('is not offered when the model was sent no effort', (
+      tester,
+    ) async {
+      await pumpFailed(tester, selected: plain);
+      expect(retryWithoutEffort, findsNothing);
+    });
+
+    testWidgets('is not offered for a chat value the model was not sent', (
+      tester,
+    ) async {
+      // A model that does not advertise support is sent only its own pick.
+      await pumpFailed(
+        tester,
+        selected: plain,
+        chatParams: const {'reasoning_effort': 'high'},
+      );
+      expect(retryWithoutEffort, findsNothing);
+    });
+
+    testWidgets('is not offered when the chat saved Automatic', (
+      tester,
+    ) async {
+      // A default saved on the chat outranks the model's own pick.
+      await pumpFailed(
+        tester,
+        selected: plain,
+        picks: {plain.id: 'high'},
+        chatParams: const {'reasoning_effort': null},
+      );
+      expect(retryWithoutEffort, findsNothing);
+    });
+
+    testWidgets('is offered for the chat value a reasoning model was sent', (
+      tester,
+    ) async {
+      await pumpFailed(
+        tester,
+        selected: const Model(id: 'gpt-5', name: 'GPT-5'),
+        chatParams: const {'reasoning_effort': 'high'},
+      );
+      expect(retryWithoutEffort, findsOneWidget);
+    });
+
+    testWidgets('clears the pick, then regenerates', (tester) async {
+      var regenerations = 0;
+      final container = await pumpFailed(
+        tester,
+        selected: plain,
+        picks: {plain.id: 'high'},
+        onRegenerate: () => regenerations += 1,
+      );
+
+      await tester.tap(retryWithoutEffort);
+      await tester.pumpAndSettle();
+
+      expect(regenerations, 1);
+      expect(localReasoningEffortForModel(container.read, plain), 'automatic');
+    });
+
+    testWidgets('does not regenerate when the pick could not be cleared', (
+      tester,
+    ) async {
+      var regenerations = 0;
+      await pumpFailed(
+        tester,
+        selected: plain,
+        picks: {plain.id: 'high'},
+        pickWritesFail: true,
+        onRegenerate: () => regenerations += 1,
+      );
+
+      await tester.tap(retryWithoutEffort);
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 5));
+      await tester.pumpAndSettle();
+
+      // Regenerating now would send the rejected value again.
+      expect(regenerations, 0);
+    });
+  });
+}
+
+final class _RefusingSelectedModel extends SelectedModel {
+  @override
+  Model? build() => const Model(
+    id: 'refusing-model',
+    name: 'Refusing',
+    capabilities: {'reasoning_effort': false},
+  );
+}
+
+final class _AdvertisingSelectedModel extends SelectedModel {
+  @override
+  Model? build() => const Model(id: 'gpt-5', name: 'GPT-5');
+}
+
+final class _SelectedAs extends SelectedModel {
+  _SelectedAs(this.model);
+
+  final Model model;
+
+  @override
+  Model? build() => model;
+}
+
+final class _ActiveAs extends ActiveConversationNotifier {
+  _ActiveAs(this.conversation);
+
+  final Conversation conversation;
+
+  @override
+  Conversation? build() => conversation;
+}
+
+/// The picker's per-model picks, held in memory. With [writesFail] every
+/// write throws, as preference storage that cannot be written does.
+final class _PickedEfforts extends LocalReasoningEfforts {
+  _PickedEfforts(this.picks, {this.writesFail = false});
+
+  final Map<String, String> picks;
+  final bool writesFail;
+
+  @override
+  Map<String, String> build() => picks;
+
+  @override
+  Future<void> set(String key, String? effort) async {
+    if (writesFail) throw StateError('Preferences are unavailable.');
+    final updated = Map<String, String>.of(state)..remove(key);
+    state = {...updated, key: ?effort};
+  }
+}
